@@ -66,6 +66,10 @@ def main():
     p.add_argument("--episodes", type=int, default=8)
     p.add_argument("--target_ell", type=float, default=0.4, help="desired peak drop prob")
     p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--freeze_a", type=float, default=1.0,
+                   help="hold the engagement-tempo driver A(t) here (1.0 = its PEAK, "
+                        "the condition SEVERITY is supposed to be sized against). "
+                        "Pass -1 to let it run live.")
     args = p.parse_args()
 
     env = StarCraft2Env({
@@ -75,6 +79,14 @@ def main():
         # _WARMUP (=500k) steps of an env's life and this script runs a few thousand,
         # so without snd_eval the measured ell/drop would be 0 regardless of --severity.
         "snd_eval": 1,
+        # *** FREEZE THE DRIVER, or the ell reading is an artifact of the clock. ***
+        # A(t) is a raised cosine of period 5000 steps starting at its TROUGH, and
+        # this script runs a few hundred: without a freeze it samples A ~= 0.01, so
+        # ell = A*sigma*x2 comes out ~100x too small and the run reads as "the NS
+        # does nothing" at any severity. (Measured: 302 steps gave A(mean)=0.012 and
+        # ell=0.008 against a true peak ell of sigma*x2.) The load x2 is unaffected --
+        # it does not depend on A -- so only the ell/drop columns were ever wrong.
+        **({} if args.freeze_a < 0 else {"snd_freeze": float(args.freeze_a)}),
     })
     env.seed(args.seed)
     print(f"[calib] map={args.map_name} severity={args.severity} (engage-and-fire script)")
@@ -96,8 +108,12 @@ def main():
     load = float(x2.mean())          # the firing load -- what SEVERITY multiplies
     print(f"[calib] steps={len(x2)}  fire_frac(mean)={firef.mean():.2f}  "
           f"firing load x2(mean)={load:.3f}")
-    print(f"[calib] at SEVERITY={args.severity}:  drop prob ell(mean)={ell.mean():.3f}  "
-          f"shots dropped(mean)={drop.mean():.3f}")
+    _drv = ("live (NOT frozen -- the ell column below is a snapshot of wherever the "
+            "clock happened to be, not the peak)" if args.freeze_a < 0
+            else f"FROZEN at A={args.freeze_a} ({'peak' if args.freeze_a >= 0.99 else 'partial'})")
+    print(f"[calib] driver: {_drv}")
+    print(f"[calib] at SEVERITY={args.severity}:  deflection ell(mean)={ell.mean():.3f}  "
+          f"shots deflected(mean)={drop.mean():.3f}")
 
     if firef.mean() < 0.05 or load < 1e-3:
         print("[calib] WARNING: almost no firing was measured (units did not engage) -- "
