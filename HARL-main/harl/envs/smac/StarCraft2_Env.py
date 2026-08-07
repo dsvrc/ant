@@ -1148,6 +1148,12 @@ class StarCraft2Env(MultiAgentEnv):
         #   1 = the env applies the pre-shift (a real compensator, Ant's structure);
         #   0 = obs-only, the policy must learn the re-aim itself from ell_hat.
         self.pact1_gpol = float(a.get("pact1_gpol", 1.0))         # trust multiplier
+        self.pact1_conf_thresh = float(a.get("pact1_conf_thresh", 0.5))
+        #   compensate only once the estimator's self-confidence clears this. The
+        #   knob is a THRESHOLD because the channel is a permutation with an integer
+        #   shift -- partial re-aim is useless or harmful (Phase 1: beta=0.5 scored
+        #   BELOW blind). Cold prior is 1/(1+r) = 0.33, so 0.5 means "wait until the
+        #   covariance has roughly halved", then compensate fully.
         self.pact1_ctde = int(a.get("pact1_ctde", 0))             # true A -> critic only
         # de-phasing: this env's starting point on the driver cycle, in [0,1).  Set by
         # make_train_env / make_eval_env from the worker rank so the ensemble tiles the
@@ -1624,13 +1630,25 @@ class StarCraft2Env(MultiAgentEnv):
         # The gain is the estimator's own confidence times a fixed multiplier: a cold
         # RLS compensates little, a converged one compensates fully, with no hand-set
         # warmup.  ell_hat comes from THIS unit's beta_hat, never from self._cwo_ell.
+        # *** TRUST IS A THRESHOLD HERE, NOT A SCALE -- and that is a MEASURED
+        # property of the channel, not a preference. ***  The shift is an INTEGER, so
+        # partial compensation does not buy partial recovery: it lands the shot on a
+        # DIFFERENT wrong enemy.  Phase 1 measured it directly -- at sigma=0.3,
+        # beta=0.5 returned 12.5 against 13.0 for no compensation at all, while
+        # re-aiming 62% of shots; beta=1.0 returned 17.5.  Scaling the shift by a
+        # ramping confidence (the natural choice on Ant's additive channel, where
+        # partial cancellation IS partially useful) would spend the whole warmup in
+        # exactly that harmful regime.  So: compensate FULLY once the estimator is
+        # confident enough, and not at all before.
         s_hat = 0
         if (
             self.snd_pact1 and self.pact1_assist
             and action >= self.n_actions_no_attack and k > 1
+            and float(self._p1_conf[a_id]) >= self.pact1_conf_thresh
         ):
-            g = float(self._p1_conf[a_id]) * self.pact1_gpol
-            s_hat = _p1_shift_from_ell(g * float(self._p1_ellhat[a_id]), k)
+            s_hat = _p1_shift_from_ell(
+                self.pact1_gpol * float(self._p1_ellhat[a_id]), k
+            )
             if s_hat > 0:
                 cur0 = int(action - self.n_actions_no_attack)
                 w0 = np.where(tgts == cur0)[0]

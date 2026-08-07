@@ -63,6 +63,7 @@
         "pact1_p0": 1.0,
         "pact1_assist": 1,
         "pact1_gpol": 1.0,
+        "pact1_conf_thresh": 0.5,
         "pact1_ctde": 0,
         "pact_cfg": {
             "gate_abort": false,
