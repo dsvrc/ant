@@ -1,0 +1,121 @@
+{
+    "algo_args": {
+        "algo": {
+            "alpha": 0.2,
+            "alpha_lr": 0.0003,
+            "auto_alpha": false,
+            "batch_size": 1000,
+            "buffer_size": 200000,
+            "fixed_order": false,
+            "gamma": 0.99,
+            "huber_delta": 10.0,
+            "n_step": 5,
+            "polyak": 0.005,
+            "share_param": false,
+            "use_huber_loss": false,
+            "use_policy_active_masks": true
+        },
+        "device": {
+            "cuda": true,
+            "cuda_deterministic": true,
+            "torch_threads": 4
+        },
+        "eval": {
+            "eval_episodes": 5,
+            "n_eval_rollout_threads": 5,
+            "use_eval": false
+        },
+        "logger": {
+            "log_dir": "./results"
+        },
+        "model": {
+            "activation_func": "relu",
+            "critic_lr": 0.0003,
+            "final_activation_func": "tanh",
+            "gain": 0.01,
+            "hidden_sizes": [
+                256,
+                256
+            ],
+            "initialization_method": "orthogonal_",
+            "lr": 0.001,
+            "use_feature_normalization": true
+        },
+        "render": {
+            "render_episodes": 10,
+            "use_render": false
+        },
+        "seed": {
+            "seed": 1,
+            "seed_specify": true
+        },
+        "train": {
+            "eval_interval": 100000,
+            "log_interval": null,
+            "model_dir": null,
+            "n_rollout_threads": 20,
+            "num_env_steps": 1000000,
+            "train_interval": 50,
+            "update_per_train": 1,
+            "use_linear_lr_decay": false,
+            "use_proper_time_limits": true,
+            "use_valuenorm": false,
+            "warmup_steps": 5000
+        }
+    },
+    "env_args": {
+        "agent_conf": "4x2",
+        "agent_obsk": 0,
+        "episode_limit": 1000,
+        "scenario": "Ant-v2",
+        "ecl": true,
+        "ecl_cfg": {
+            "hip_action_idx": 0,
+            "ankle_action_idx": 1,
+            "readout_qvel_idx": [17, 19, 21, 23],
+            "readout_qvel_idx_ankle": [18, 20, 22, 24],
+            "use_ankle_channel": true,
+            "gain_halflife": 200,
+            "power_halflife": 600,
+            "center_halflife": 200,
+            "range_norm": true,
+            "q_fast_hl": 50,
+            "q_slow_hl": 80000,
+            "delta": 1e-6,
+            "rho": 0.8,
+            "W": 2000,
+            "identifier_mode": "clipfit",
+            "grid_dc": 0.025,
+            "c_grid_max": 1.2,
+            "lock_min_gain": 0.01,
+            "x2_margin": 25,
+            "lambda_reg": 1e-3,
+            "smooth_windows": 2.0,
+            "c_clip": 1.5,
+            "cmax_halflife_cycles": 2,
+            "c_max_init": 0.1,
+            "warmup_windows": 3,
+            "beta_A": 0.25,
+            "beta_U": 0.10,
+            "h_frac": 0.15,
+            "h_min_abs": 0.05,
+            "c_low_frac": 0.10,
+            "adaptive_trough": true,
+            "pool": 8192,
+            "coldstart_min": 5,
+            "retag_interval": 100000,
+            "pcr_period": 40000,
+            "eval_dephase": true,
+            "severity": 0.9,
+            "tag_oracle": false,
+            "kl_anchor": false,
+            "kl_anchor_coef": 0.3
+        }
+    },
+    "main_args": {
+        "algo": "ecl",
+        "env": "mamujoco",
+        "exp_name": "ecl_smoke",
+        "load_config": ""
+    }
+}

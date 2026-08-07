@@ -1,0 +1,145 @@
+# RECON = HAPPO + (central hindsight reconstruction -> local amortized filtering
+#                   -> certainty-equivalent action with a conjugating layer).
+#
+# Everything above the `recon:` block is HAPPO's config **verbatim** (Prohibition 1
+# — identical host hypers across every arm). Everything inside it is either fixed
+# by the derivation or is one of the method's two real knobs.
+#
+#   REAL KNOBS (spec §3.4):  recon.beta_mode ,  recon.identifier.lock_min_gain
+#   DERIVED / FIXED:         filter.hidden (from 1/(1-rho) ~ 5-15 steps of memory)
+#                            filter.lr, identifier.W (from Delta_c), rho_grid
+seed:
+  seed_specify: True
+  seed: 1
+device:
+  cuda: True
+  cuda_deterministic: True
+  torch_threads: 4
+train:
+  n_rollout_threads: 20
+  num_env_steps: 10000000
+  episode_length: 200
+  log_interval: 5
+  eval_interval: 25
+  use_valuenorm: True
+  use_linear_lr_decay: False
+  use_proper_time_limits: True
+  model_dir: ~
+eval:
+  use_eval: True
+  n_eval_rollout_threads: 10
+  eval_episodes: 20
+render:
+  use_render: False
+  render_episodes: 10
+model:
+  hidden_sizes: [128, 128]
+  activation_func: relu
+  use_feature_normalization: True
+  initialization_method: orthogonal_
+  gain: 0.01
+  use_naive_recurrent_policy: False
+  use_recurrent_policy: False
+  recurrent_n: 1
+  data_chunk_length: 10
+  lr: 0.0005
+  critic_lr: 0.0005
+  opti_eps: 0.00001
+  weight_decay: 0
+  std_x_coef: 1
+  std_y_coef: 0.5
+algo:
+  # ---- HAPPO, untouched ----
+  ppo_epoch: 5
+  critic_epoch: 5
+  use_clipped_value_loss: True
+  clip_param: 0.2
+  actor_num_mini_batch: 1
+  critic_num_mini_batch: 1
+  entropy_coef: 0.01
+  value_loss_coef: 1
+  use_max_grad_norm: True
+  max_grad_norm: 10.0
+  use_gae: True
+  gamma: 0.99
+  gae_lambda: 0.95
+  use_huber_loss: True
+  use_policy_active_masks: True
+  huber_delta: 10.0
+  action_aggregation: prod
+  share_param: False
+  fixed_order: False
+  # ---- RECON ----
+  recon:
+    # [CP] the conjugating compensation layer: u = clip(a - beta*lhat).
+    # false => the conditioning-only arm (Stage A), and the discrete-env default.
+    compensate: true
+    # fixed => beta == beta_fixed (1.0, i.e. exact inversion — T2).
+    # learned => a sigmoid gain fit on min_b E||l~ - b*lhat||^2, the shrinkage
+    #            factor T3 predicts and T5 blames for the measured beta-inversion.
+    beta_mode: fixed
+    beta_fixed: 1.0
+    # how the filter's TARGET is made:
+    #   self_supervised — d̃ = (y − ĝ0·a)/ĝ0 from the OWN readout (disturbance
+    #     observer). No central c. Phase-correct (the central ĉ was measured
+    #     ANTI-correlated, −0.35, on the trained gait). This is the default after
+    #     runs #1–#4 showed central identification is anti-observable here.
+    #   central — the original ĉ·x2 hindsight label; kept for the ablation and the
+    #     paper's negative result. Uses trough_baseline + the identifier below.
+    label_mode: self_supervised
+    # auto-select the readout coordinate per (agent, channel): use whichever raw-obs
+    # column its own torque actually drives, locked over the first auto_lock_after
+    # (high-excitation) iterations. Removes the fragile fixed-index assumption — the
+    # velocity vs position response swaps as the gait matures (measured: velocity cols
+    # fell to corr 0.11 while position held 0.60), which crashed fixed-index runs.
+    auto_readout: true
+    auto_lock_after: 5
+    # trough-baseline subtraction (central mode only): c_hat reads (torso) + c_PCR(t);
+    # subtract the trough floor (low percentile of recent c_hat) so the labels
+    # VANISH at the payload trough and [CP] stops injecting harm where there is
+    # nothing to cancel. Needs ~1 payload cycle (~200 iters) of history to seat.
+    trough_baseline: true
+    trough_floor_pct: 10.0
+    trough_hist: 40
+    # [F]+[DI] — the only learned addition. Own Adam, decoupled from every RL loss.
+    filter:
+      arch: gru          # gru | mlp (the sanctioned stacked-frame fallback)
+      hidden: 64
+      adam_lr: 0.0003    # NOT `lr`: update_args would rewrite it from a host --lr
+      epochs: 4          # full-sequence passes over the fresh rollout per iteration
+      stack_len: 16      # mlp arch only
+      var_head: false    # optional uncertainty head; reporting only, gates nothing
+      grad_clip: 10.0    # NOT `max_grad_norm`, same reason as adam_lr
+    # [ID] — ECLIdentifier (clipfit) reused as a library.
+    identifier:
+      mode: clipfit
+      # rho is the benchmark's KNOWN structural constant. The grid mis-selected
+      # 0.6; fixed 0.8 here (ECL's working value). Set rho_grid: [...] to ablate.
+      rho_grid: null
+      rho: 0.8
+      # the same-step nuisance term BACKFIRED (run #3: S collinear with x2 ⇒ it
+      # left the constant coupling in c AND ate the payload modulation, c_corr
+      # 0.47 → 0.03). OFF; the constant offset is removed by trough_baseline.
+      nuisance_instant: false
+      W: 2000            # per-thread steps; also the window over which c_hat is
+                         # held constant by [RE] => T3's Delta_c*W term
+      lock_min_gain: 0.01
+      grid_dc: 0.025
+      c_grid_max: 1.2
+      x2_margin: 25
+      c_clip: 1.5
+      smooth_windows: 2.0
+      use_ankle_channel: true
+      hip_action_idx: 0
+      ankle_action_idx: 1
+    # ---- labeled ceiling arm (Stage A): lhat := the env's true d. Prints a banner.
+    filter_oracle: false
+    # ---- diagnostics ----
+    debug: true
+    debug_every: 1       # iterations per recon_debug.csv row
+    scan_every: 50       # iterations per readout-index scan
+    # sigma, for the c_true diagnostic column ONLY (never an input to the method).
+    # Defaults to $ANT_PCR_SEVERITY, else the repaired benchmark's 0.45.
+    severity_diag: 0.45
+logger:
+  log_dir: "./results"
