@@ -72,6 +72,12 @@ ALGO_REGISTRY = {
     # extra bounded action dim). Still stock HAPPO -- nothing about the learner
     # changes, so every arm shares host hyperparameters.
     "pact_1": HAPPO,
+    # SMAC PACT-1: same idea on the discrete channel. The interference split across
+    # the same-type / cross-type fire-control channels is unknown and drifting; each
+    # unit tracks it from where its OWN shots actually land, and the env applies the
+    # exact permutation inverse (a target pre-shift) at the estimator's confidence.
+    # Still stock HAPPO -- everything is env-side.
+    "smac_pact_1": HAPPO,
     # PCR diagnosis campaign: the host policy/critic are HASAC's, untouched
     # (Prohibition 2 — host hyperparameters identical across every arm). The
     # telemetry lives entirely in OffPolicyDiagRunner.

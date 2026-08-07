@@ -84,6 +84,9 @@ RUNNER_REGISTRY = {
     # compares the PREDICTED load d_hat against the true pcr_d_next, which is a
     # stricter and more directly meaningful check than the old x2 waveform cosine.
     "pact_1": _pact_runner,
+    # SMAC PACT-1: same dispatch -> OnPolicyPactSmacRunner (env is smac), which now
+    # also logs the p1_* estimator columns.
+    "smac_pact_1": _pact_runner,
     # PCR diagnosis campaign: HASAC + read-only, RNG-transparent telemetry.
     # Not a method — with telemetry off it IS hasac, and with it on the training
     # trajectory is still bit-identical (see OffPolicyDiagRunner._rng_frozen).

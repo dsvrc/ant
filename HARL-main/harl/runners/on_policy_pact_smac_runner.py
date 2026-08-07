@@ -84,6 +84,15 @@ _COLS = [
     "r_step_mean", "ep_len_mean",
     # smacv2/CWD leak gate (≡1 for smac CWO):
     "gate_cos", "n_gate",
+    # --- PACT-1 only (nan otherwise) ---
+    # p1_ellhat     the deflection each unit PREDICTS from its own beta_hat
+    # p1_conf       estimator self-confidence (the trust prior)
+    # p1_beta_err   ||beta_hat - beta_true||: is the split being tracked?
+    # p1_raw_shift  |s| the channel applied  } their gap is THE result: raw is what
+    # p1_net_shift  |s - s_hat| after re-aim } a blind unit eats, net is what is left
+    # p1_obs_frac   fraction of units that got a usable reading this step
+    "p1_ellhat", "p1_conf", "p1_beta_err", "p1_raw_shift", "p1_net_shift",
+    "p1_obs_frac",
 ]
 
 
@@ -99,10 +108,12 @@ class OnPolicyPactSmacRunner(OnPolicyHARunner):
         # spurious -0.006 once per driver cycle).  _m() drops non-finite entries.
         self._severity = float(env_args.get("snd_severity", float("nan")))
 
-        if not (int(env_args.get("snd_pact", 0)) or int(env_args.get("cwd_pact", 0))):
-            print("[PACT][WARN] neither env_args.snd_pact (smac) nor cwd_pact (smacv2) "
-                  "is set — obs is NOT augmented, so `--algo pact` == BLIND. Set "
-                  "\"snd_pact\": 1 in the config's env_args.", flush=True)
+        if not (int(env_args.get("snd_pact", 0)) or int(env_args.get("cwd_pact", 0))
+                or int(env_args.get("snd_pact1", 0))):
+            print("[PACT][WARN] none of env_args.snd_pact (smac), snd_pact1 (smac "
+                  "PACT-1) or cwd_pact (smacv2) is set — obs is NOT augmented and no "
+                  "compensation runs, so this arm == BLIND. Set \"snd_pact1\": 1 in "
+                  "the config's env_args.", flush=True)
 
         cfg = dict(env_args.get("pact_cfg", {}))
         self._gate_abort = bool(cfg.get("gate_abort", False))  # off by default (trivial for CWO)
@@ -136,7 +147,9 @@ class OnPolicyPactSmacRunner(OnPolicyHARunner):
         keys = ["A", "sigma", "ell", "ell_max", "drop", "x2", "x2_spread",
                 "x3", "x3try",
                 "fire", "avail", "hold", "thru", "fire_hi", "fire_lo",
-                "r", "cos", "gate_cos"]
+                "r", "cos", "gate_cos",
+                # PACT-1 (absent -> nan -> dropped by _m)
+                "p1_ellhat", "p1_conf", "p1_beta_err", "p1_raw", "p1_net", "p1_obs"]
         acc = {k: [] for k in keys}
         for ph in ("peak", "trough"):
             for k in ("ell", "drop", "fire", "hold", "thru", "fire_hi", "fire_lo"):
@@ -174,6 +187,13 @@ class OnPolicyPactSmacRunner(OnPolicyHARunner):
             a["fire_hi"].append(fire_hi)
             a["fire_lo"].append(fire_lo)
             a["r"].append(float(np.asarray(rewards[i]).reshape(-1)[0]))
+            # PACT-1 estimator telemetry
+            a["p1_ellhat"].append(float(d.get("p1_ellhat", np.nan)))
+            a["p1_conf"].append(float(d.get("p1_conf", np.nan)))
+            a["p1_beta_err"].append(float(d.get("p1_beta_err", np.nan)))
+            a["p1_raw"].append(float(d.get("p1_raw_shift", np.nan)))
+            a["p1_net"].append(float(d.get("p1_net_shift", np.nan)))
+            a["p1_obs"].append(float(d.get("p1_obs_frac", np.nan)))
             # leak gate (smacv2/CWD): only counts where there is real waveform signal
             cos = float(d.get("pact_cos", np.nan))
             x2l = float(d.get("pact_x2load", np.nan))
@@ -236,6 +256,8 @@ class OnPolicyPactSmacRunner(OnPolicyHARunner):
             m(a["r"]),
             (self._m(self._ep_lens) if self._ep_lens else float("nan")),
             gate_cos, n_gate,
+            m(a["p1_ellhat"]), m(a["p1_conf"]), m(a["p1_beta_err"]),
+            m(a["p1_raw"]), m(a["p1_net"]), m(a["p1_obs"]),
         ]
         if self._dbg_w is not None:
             self._dbg_w.writerow([round(v, 5) if isinstance(v, float) else v for v in row])

@@ -29,6 +29,19 @@ import yaml
 import random
 from gym.spaces import Discrete
 
+from .pact.pact1_core import (
+    AgentRLS as _P1RLS,
+    MIXNORM as _P1MIXNORM,
+    R as _P1R,
+    THETA_LEGACY as _P1THETA_LEGACY,
+    ell_from_shift as _p1_ell_from_shift,
+    predict_ell as _p1_predict_ell,
+    shift_from_ell as _p1_shift_from_ell,
+    theta_anchors as _p1_theta_anchors,
+    theta_at as _p1_theta_at,
+    type_split as _p1_type_split,
+)
+
 races = {
     "R": sc_common.Random,
     "P": sc_common.Protoss,
@@ -292,6 +305,53 @@ _DEPHASE = os.environ.get("SMAC_SND_DEPHASE", "1").lower() not in ("0", "false",
 # to do instead of learning to compensate.
 _PHI_ENGAGE = os.environ.get("SMAC_SND_PHI", "engage").lower() != "fire"
 
+# ###########################################################################
+# ###  PACT-1 HARDENING -- the interference SPLIT is unknown.  DEFAULT OFF. ##
+# ###########################################################################
+# The squad shares a fire-control bus, but not every teammate loads it the same way:
+# units on the same channel interfere differently from units on another.  On 3s5z
+# (3 stalkers + 5 zealots) the natural basis is same-type vs cross-type, and HOW the
+# squad's emissions split across those two channels is a property of the loadout --
+# unknown, and drifting as the engagement develops.
+#
+#     x_m,i <- RHO*x_m,i + (1-RHO)*B_m,i        B_same, B_cross  (each /(N-1))
+#     psi_i  = MIXNORM * [x_1,i, x_2,i]         computable by the agent, exactly
+#     ell_i  = c(t) * sum_m theta_m psi_m,i  =  beta* . psi_i ,   beta* = c(t)*theta
+#
+# The agent is told the two channels EXIST (that is squad composition, which it can
+# see) but not how the load splits between them.  So the unknown goes from one hidden
+# scalar to a drifting r-vector that has to be tracked ONLINE, DECENTRALIZED, from
+# each unit's own observation of where its shots actually landed.
+#
+# BACKWARD COMPATIBILITY IS EXACT.  B_same + B_cross == the legacy uniform average,
+# so theta=(1/2,1/2) with MIXNORM=2 reproduces the current env byte for byte.  The
+# hardened env strictly CONTAINS the old one.  (Asserted in pact/test_pact1.py.)
+#
+# NOTE (honest, and a paper point): re-aiming does NOT change Phi -- a unit that
+# pre-shifts its target is still engaged, still firing.  So unlike Ant, SMAC has NO
+# COMPENSATION LOOP: compensating here does not feed the medium it compensates
+# against.  That makes this env the CONTRAST CASE for the loop/commons result --
+# it should show no over-compensation and no Pigouvian CTDE lift.  Set
+# SMAC_SND_LOOP=1 to close the loop deliberately (emitting a stronger corrected
+# targeting solution loads the bus harder) and recover Ant's structure.
+_PACT1_MIX = os.environ.get("SMAC_SND_MIX", "0").lower() not in ("0", "false", "", "no")
+_PACT1_SEED = int(os.environ.get("SMAC_SND_MIX_SEED", "0"))
+#                 *** set this to the RUN SEED *** so theta rides the seed axis you
+#                 already sweep and hardening costs no extra runs.
+_PACT1_PERIOD = int(float(os.environ.get("SMAC_SND_MIX_PERIOD", "8000")))
+#                 how long the loadout takes to slide between its anchors and back.
+#                 Slower than the driver cycle (_PERIOD=5000); a second timescale.
+_PACT1_RADIUS = float(os.environ.get("SMAC_SND_MIX_RADIUS", "0.35"))
+#                 how far the split may wander from the legacy point.  THE "a bit
+#                 harder" DIAL.  The harm is NOT constant across the simplex, so an
+#                 unbounded theta is a different task at a different effective
+#                 severity -- outside the certified frontier, where nothing recovers.
+_PACT1_CONC = float(os.environ.get("SMAC_SND_MIX_CONC", "0.9"))
+_PACT1_LOOP = float(os.environ.get("SMAC_SND_LOOP", "0"))
+#                 >0 closes the compensation loop: Phi_j <- Phi_j*(1 + LOOP*|s_hat_j|)
+#                 so a unit that corrects harder loads the bus harder.  0 = the
+#                 contrast case (no loop), which is the default.
+
 _NS_BANNER_SHOWN = False  # print the resolved NS config once per process
 
 
@@ -490,6 +550,7 @@ class StarCraft2Env(MultiAgentEnv):
         self._cwo_diag = {}                                        # per-step debug telemetry
         self._snd_sigma_applied = 0.0                             # curriculum severity this step
         self._cwo_rng = np.random.RandomState(0)  # weapon-jam RNG; re-seeded in seed()
+        self._pact1_init_state()
         self._snd_payload = 0.0                                    # A(t)
         self._snd_load_mean = 0.0
         self._snd_load_max = 0.0
@@ -729,6 +790,19 @@ class StarCraft2Env(MultiAgentEnv):
         self._cwo_x3try = np.zeros(self.n_agents, dtype=np.float32)  # attempts (reset each ep)
         self._cwo_ell = np.zeros(self.n_agents, dtype=np.float32)  # drop probability
         self._cwo_can_fire = np.zeros(self.n_agents, dtype=np.float32)
+        if self.snd_pact1:
+            # The bus is cold again, so the accumulators and this episode's sensor
+            # readings are stale -- drop them.  The ESTIMATE (beta_hat and its
+            # covariance) PERSISTS: the loadout split drifts on a timescale far longer
+            # than an episode, so forgetting it every reset would throw away the only
+            # thing that is genuinely learnable across the run.
+            self._p1_x[:] = 0.0
+            self._p1_psi[:] = 0.0
+            self._p1_ellhat[:] = 0.0
+            self._p1_ellmeas[:] = 0.0
+            self._p1_sobs[:] = -1.0
+            self._p1_kobs[:] = 0
+            self._p1_shat[:] = 0
 
         if self.heuristic_ai:
             self.heuristic_targets = [None] * self.n_agents
@@ -822,6 +896,13 @@ class StarCraft2Env(MultiAgentEnv):
         # applies it (from the end of the previous step).  Reset this step's drop
         # record; get_agent_action sets _cwo_dropped[i]=1 when unit i's shot jams.
         self._cwo_dropped = np.zeros(self.n_agents, dtype=np.float32)
+        # PACT-1 per-step sensor buffers. Cleared HERE, before get_agent_action fills
+        # them, and read by _pact1_observe inside _snd_step -- which runs after all
+        # the actions have been applied, so every unit's reading is present.
+        if self.snd_pact1:
+            self._p1_sobs[:] = -1.0        # -1 = "no shot fired / no choice of target"
+            self._p1_kobs[:] = 0
+            self._p1_shat[:] = 0
 
         self.last_action = np.eye(self.n_actions)[np.array(actions_int)]
 
@@ -951,6 +1032,7 @@ class StarCraft2Env(MultiAgentEnv):
             self.battles_game += 1
             self.timeouts += 1
 
+        p1_diag = self._pact1_diag() if self.snd_pact1 else {}   # computed once, not per agent
         for i in range(self.n_agents):
             infos[i] = {
                 "battles_won": self.battles_won,
@@ -972,8 +1054,11 @@ class StarCraft2Env(MultiAgentEnv):
                 "cwo_sigma": self._snd_sigma_applied,  # curriculum severity applied (ramps 0->SEVERITY)
                 "pact_cos": 1.0,   # x2 is a scalar computed env-side => exact, no leak gate
                 "pact_x2load": (
-                    self._cwo_diag.get("cwo_x2_mean", 0.0) if self.snd_pact else 0.0
+                    self._cwo_diag.get("cwo_x2_mean", 0.0)
+                    if (self.snd_pact or self.snd_pact1) else 0.0
                 ),
+                # --- PACT-1 telemetry (logging only) ---
+                **p1_diag,
                 **self._cwo_diag,  # cwo_{ell_mean,ell_max,x2_mean,fire_frac,drop_frac,
                 #                    fire_hi_load,fire_lo_load} -- see _cwo_fill_diag
             }
@@ -1055,15 +1140,32 @@ class StarCraft2Env(MultiAgentEnv):
         )
         self.snd_eval = int(a.get("snd_eval", 0))  # eval env -> skip the warmup curriculum
         #                                            (use the full severity to measure harm)
+        # --- PACT-1: unknown interference split, estimated online -----------------
+        self.snd_pact1 = int(a.get("snd_pact1", 0))
+        self.pact1_forget = float(a.get("pact1_forget", 0.995))   # RLS forgetting
+        self.pact1_p0 = float(a.get("pact1_p0", 1.0))             # RLS prior looseness
+        self.pact1_assist = int(a.get("pact1_assist", 1))
+        #   1 = the env applies the pre-shift (a real compensator, Ant's structure);
+        #   0 = obs-only, the policy must learn the re-aim itself from ell_hat.
+        self.pact1_gpol = float(a.get("pact1_gpol", 1.0))         # trust multiplier
+        self.pact1_ctde = int(a.get("pact1_ctde", 0))             # true A -> critic only
         # de-phasing: this env's starting point on the driver cycle, in [0,1).  Set by
         # make_train_env / make_eval_env from the worker rank so the ensemble tiles the
         # cycle (see the _DEPHASE note); 0 reproduces the old all-in-phase behaviour.
         phase = float(a.get("snd_phase", 0.0)) if _DEPHASE else 0.0
         self._snd_phase0 = int((phase % 1.0) * _PERIOD)
-        assert not (self.snd_oracle and self.snd_pact), (
-            "CWO: oracle (true ell) and pact (computed x2) fill the same obs slot; "
-            "enable at most one."
+        assert sum([bool(self.snd_oracle), bool(self.snd_pact), bool(self.snd_pact1)]) <= 1, (
+            "oracle (true ell), pact (given x2) and pact1 (estimated beta) all fill "
+            "the same obs slot; enable at most one."
         )
+        if self.snd_pact1:
+            assert _KNEE == 0.0 and _LMAX >= 1.0, (
+                f"PACT-1 needs the LINEAR channel ell = c*x2 for the estimator's "
+                f"regression to be well posed, i.e. SMAC_SND_KNEE=0 and "
+                f"SMAC_SND_LMAX>=1 (got knee={_KNEE}, lmax={_LMAX}). With a knee or a "
+                f"cap the map from psi to ell is piecewise and beta* is not "
+                f"identifiable from deflection readings alone."
+            )
 
     def _snd_banner(self):
         global _NS_BANNER_SHOWN
@@ -1073,6 +1175,10 @@ class StarCraft2Env(MultiAgentEnv):
         mode = "blind"
         if self.snd_oracle:
             mode = "ORACLE (true ell in obs+state)"
+        elif self.snd_pact1:
+            mode = "PACT-1 (beta_hat estimated online%s)" % (
+                ", env pre-shifts" if self.pact1_assist else ", obs only"
+            ) + (" +CTDE" if self.pact1_ctde else "")
         elif self.snd_pact:
             mode = "PACT (computed x2%s in obs+state)" % (
                 "+x3" if self.snd_pact_feedback else ""
@@ -1104,6 +1210,129 @@ class StarCraft2Env(MultiAgentEnv):
                       f"team may barely be hurt and the arms will not separate. Raise "
                       f"SEVERITY. Certify with `python -m harl.envs.smac.pact.phase1`.",
                       flush=True)
+        if _PACT1_MIX:
+            a_, b_ = _p1_theta_anchors(_PACT1_SEED, _PACT1_RADIUS, _PACT1_CONC, _P1R)
+            print(
+                f"[NS] MIX=ON seed={_PACT1_SEED} period={_PACT1_PERIOD} "
+                f"radius={_PACT1_RADIUS} conc={_PACT1_CONC} loop={_PACT1_LOOP}\n"
+                f"     interference split theta slides between "
+                f"[{a_[0]:.3f} {a_[1]:.3f}] and [{b_[0]:.3f} {b_[1]:.3f}] "
+                f"(same-type, cross-type).\n"
+                f"     W(theta) is HIDDEN; the agent knows only that the two channels "
+                f"exist.",
+                flush=True,
+            )
+        else:
+            print("[NS] MIX=OFF -> theta pinned at (0.5,0.5); the shared load is "
+                  "byte-identical to the pre-PACT-1 env.", flush=True)
+
+    # ------------------------------------------------------------- PACT-1 --
+    def _pact1_init_state(self):
+        """Per-instance PACT-1 state.  All of it is either shared-engagement
+        arithmetic or the unit's own observation of its own shots -- nothing here
+        reads self._cwo_ell (the true liability), which is the hygiene line."""
+        n = self.n_agents
+        self._p1_x = np.zeros((_P1R, n))        # per-basis leaky accumulators
+        self._p1_psi = np.zeros((_P1R, n))      # regressor ALIGNED with the applied ell
+        self._p1_types = np.full(n, -1, dtype=np.int64)
+        self._p1_rls = [
+            _P1RLS(_P1R, self.pact1_forget, self.pact1_p0) for _ in range(n)
+        ]
+        self._p1_beta = np.zeros((n, _P1R))     # beta_hat per agent
+        # cold-prior confidence, so the value in the obs is meaningful from step 1
+        # rather than a spurious 0 until the first _snd_step refreshes it
+        self._p1_conf = np.full(n, self._p1_rls[0].confidence())
+        self._p1_ellhat = np.zeros(n)           # predicted deflection for NEXT step
+        self._p1_shat = np.zeros(n, dtype=np.int64)     # pre-shift applied this step
+        self._p1_sobs = np.full(n, -1.0)        # observed true shift this step (-1 = none)
+        self._p1_kobs = np.zeros(n, dtype=np.int64)     # attackable enemies this step
+        self._p1_ellmeas = np.zeros(n)          # last sensor reading
+        self._p1_th_a, self._p1_th_b = _p1_theta_anchors(
+            _PACT1_SEED, _PACT1_RADIUS, _PACT1_CONC, _P1R
+        )
+        self._p1_theta = _P1THETA_LEGACY.copy()
+
+    def _pact1_theta(self):
+        """theta(t): how the squad's emissions split across the two channels.
+        Pinned at the legacy (1/2, 1/2) when mixing is off, which with MIXNORM=2
+        reproduces the pre-PACT-1 load exactly."""
+        if not _PACT1_MIX:
+            return _P1THETA_LEGACY
+        return _p1_theta_at(self._snd_clock, _PACT1_PERIOD,
+                            self._p1_th_a, self._p1_th_b)
+
+    def _pact1_refresh_types(self):
+        """Cache each unit's type id (stalker vs zealot on 3s5z).  Squad composition
+        is visible to the team, so this is not privileged -- it is which channel a
+        teammate emits on, not how hard that channel loads the bus."""
+        for j in range(self.n_agents):
+            u = self.get_unit_by_id(j)
+            if u is not None:
+                self._p1_types[j] = int(u.unit_type)
+
+    def _pact1_observe(self):
+        """RLS update from THIS step's deflection readings.
+
+        A unit that fired at one of K>1 attackable enemies sees where its shot
+        actually landed, and knows the pre-shift s_hat it applied itself, so it can
+        reconstruct the true displacement s and read off  ell_meas = s/(K-1).  The
+        regressor is self._p1_psi, which is the psi that PRODUCED the ell applied
+        this step -- so the pair is time-aligned.  Quantisation error <= 0.5/(K-1)."""
+        for i in range(self.n_agents):
+            k = int(self._p1_kobs[i])
+            if k <= 1 or self._p1_sobs[i] < 0.0:
+                continue                        # no shot, or no choice of target
+            y = _p1_ell_from_shift(self._p1_sobs[i], k)
+            if y is None:
+                continue
+            self._p1_ellmeas[i] = y
+            self._p1_rls[i].update(self._p1_psi[:, i], y)
+        for i in range(self.n_agents):
+            self._p1_beta[i] = self._p1_rls[i].beta
+            self._p1_conf[i] = self._p1_rls[i].confidence()
+
+    def _pact1_advance(self, exert, denom, alive):
+        """Run the per-basis leak, rebuild psi, and return the TRUE shared load x2.
+
+        Returns x2 (n,).  Also refreshes self._p1_psi (aligned with the ell that this
+        x2 will produce) and self._p1_ellhat (what each unit PREDICTS it will suffer
+        next step, from its own beta_hat -- the quantity the compensator uses)."""
+        same, cross = _p1_type_split(exert, self._p1_types, denom)
+        B = np.stack([same, cross], axis=0)                  # (r, n)
+        self._p1_x = _RHO * self._p1_x + (1.0 - _RHO) * B
+        psi = _P1MIXNORM * self._p1_x                        # (r, n)
+        th = self._pact1_theta()
+        self._p1_theta = th
+        x2 = (th[:, None] * psi).sum(axis=0)
+        self._p1_psi = psi
+        for i in range(self.n_agents):
+            self._p1_ellhat[i] = max(0.0, _p1_predict_ell(self._p1_beta[i], psi[:, i]))
+        self._p1_ellhat[~alive] = 0.0
+        return x2.astype(np.float32)
+
+    def _pact1_diag(self):
+        """PACT-1 telemetry for pact_debug.csv.  Logging only -- beta_true and the
+        tracking error are the same class of privileged column as pcr_beta_true on
+        Ant and must never reach a policy input."""
+        beta_true = float(self._snd_payload) * self._snd_sigma_applied * self._p1_theta
+        beta_hat = self._p1_beta.mean(axis=0)
+        fired = self._p1_kobs > 1
+        return {
+            "p1_ellhat": float(self._p1_ellhat.mean()),
+            "p1_conf": float(self._p1_conf.mean()),
+            "p1_beta_err": float(np.linalg.norm(beta_hat - beta_true)),
+            "p1_beta_hat0": float(beta_hat[0]),
+            "p1_beta_true0": float(beta_true[0]),
+            "p1_shat": float(self._p1_shat.mean()),
+            "p1_obs_frac": float(fired.mean()),   # how often the sensor fires at all
+            # net displacement AFTER compensation: 0 == the shot landed where aimed
+            "p1_net_shift": float(
+                np.mean(np.abs(self._p1_sobs[fired] - self._p1_shat[fired]))
+            ) if fired.any() else 0.0,
+            "p1_raw_shift": float(
+                np.mean(np.abs(self._p1_sobs[fired]))
+            ) if fired.any() else 0.0,
+        }
 
     def _snd_grow_spaces(self):
         """Grow the declared obs/state sizes by the append: each agent's obs gets its
@@ -1112,6 +1341,11 @@ class StarCraft2Env(MultiAgentEnv):
         (the true driver A)."""
         if self.snd_oracle:
             add_obs, add_state = 1, self.n_agents
+        elif self.snd_pact1:
+            # [ell_hat_i, beta_hat_i (r), conf_i, last ell_meas_i] -- the estimator's
+            # state, all of it computed from shared engagement + this unit's own shots
+            add_obs = 1 + _P1R + 1 + 1
+            add_state = add_obs * self.n_agents + (1 if self.pact1_ctde else 0)
         elif self.snd_pact:
             add_obs = 1 + (2 if self.snd_pact_feedback else 0)  # x2 [, x3_jam, x3_try]
             add_state = add_obs * self.n_agents + (1 if self.snd_pact_ctde else 0)
@@ -1149,6 +1383,16 @@ class StarCraft2Env(MultiAgentEnv):
         _snd_grow_spaces()."""
         if self.snd_oracle:
             blocks = [self._cwo_ell]           # the TRUE liability (privileged)
+        elif self.snd_pact1:
+            # the ESTIMATOR's state -- never the true liability.  ell_hat is what the
+            # unit predicts from its own beta_hat; conf is the RLS covariance readout;
+            # ell_meas is its last observation of its own deflected shot.
+            blocks = [
+                self._p1_ellhat.astype(np.float32),
+                *[self._p1_beta[:, m].astype(np.float32) for m in range(_P1R)],
+                self._p1_conf.astype(np.float32),
+                self._p1_ellmeas.astype(np.float32),
+            ]
         elif self.snd_pact:
             blocks = [self._cwo_x2]            # the COMPUTED shared load (the method)
             if self.snd_pact_feedback:
@@ -1162,7 +1406,7 @@ class StarCraft2Env(MultiAgentEnv):
             for i, o in enumerate(local_obs)
         ]
         g = per_agent.flatten()
-        if self.snd_pact and self.snd_pact_ctde:
+        if (self.snd_pact and self.snd_pact_ctde) or (self.snd_pact1 and self.pact1_ctde):
             g = np.append(g, np.float32(self._snd_payload))
         global_state = [
             np.append(np.asarray(s, dtype=np.float32), g).astype(np.float32)
@@ -1287,8 +1531,21 @@ class StarCraft2Env(MultiAgentEnv):
         sigma = self._curr_severity()          # the CURRICULUM severity applied this step
         self._snd_sigma_applied = sigma
         denom = float(max(1, n - 1))
-        S = (float(exert.sum()) - exert) / denom      # (sum_{j!=i} Phi_j)/(N-1), in [0,1]
-        self._cwo_x2 = _RHO * self._cwo_x2 + (1.0 - _RHO) * S            # PACT waveform
+        if self.snd_pact1:
+            # PACT-1.  ORDER MATTERS.  Estimate FIRST, from this step's deflection
+            # readings against self._p1_psi (the regressor that produced the ell just
+            # applied) -- only then advance the leak, or the pair goes out of
+            # alignment by one step and the regression fits the wrong thing.
+            self._pact1_refresh_types()
+            self._pact1_observe()
+            if _PACT1_LOOP > 0.0:
+                # close the loop: correcting harder emits harder, and emitting harder
+                # loads the bus (off by default -- see the _PACT1_LOOP note).
+                exert = exert * (1.0 + _PACT1_LOOP * np.abs(self._p1_shat))
+            self._cwo_x2 = self._pact1_advance(exert, denom, alive)
+        else:
+            S = (float(exert.sum()) - exert) / denom  # (sum_{j!=i} Phi_j)/(N-1), in [0,1]
+            self._cwo_x2 = _RHO * self._cwo_x2 + (1.0 - _RHO) * S        # PACT waveform
         # The LOCAL residual that reveals the hidden driver, as TWO raw leaky counters
         # rather than one derived rate:  x3_jam = "shots of mine that jammed lately",
         # x3_try = "shots I attempted lately".  The policy forms the ratio itself, and
@@ -1311,6 +1568,11 @@ class StarCraft2Env(MultiAgentEnv):
         self._cwo_x3[~alive] = 0.0
         self._cwo_x3try[~alive] = 0.0
         self._cwo_ell[~alive] = 0.0
+        if self.snd_pact1:
+            self._p1_x[:, ~alive] = 0.0
+            self._p1_psi[:, ~alive] = 0.0
+            self._p1_ellhat[~alive] = 0.0
+            self._p1_ellmeas[~alive] = 0.0
         self._snd_load_mean = float(self._cwo_ell.mean()) if n else 0.0
         self._snd_load_max = float(self._cwo_ell.max()) if n else 0.0
 
@@ -1350,15 +1612,40 @@ class StarCraft2Env(MultiAgentEnv):
         # Blind agents are hurt badly because SMAC rewards FOCUS FIRE: a mis-aimed squad
         # spreads damage over many enemies, kills nothing, and dies to a full-strength
         # enemy line.  Nothing is physically removed -- the damage still lands.
+        tgts = np.where(np.asarray(avail_actions[self.n_actions_no_attack:]) > 0)[0]
+        k = int(tgts.size)
+
+        # --- PACT-1 COMPENSATION: pre-shift the commanded target BACKWARD by the
+        # deflection this unit predicts it is about to suffer, so the channel's
+        # forward shift lands the shot where the policy actually aimed.  This is the
+        # real channel inverse (a permutation), not an obs hint -- when s_hat == s it
+        # cancels exactly and at zero cost.
+        #
+        # The gain is the estimator's own confidence times a fixed multiplier: a cold
+        # RLS compensates little, a converged one compensates fully, with no hand-set
+        # warmup.  ell_hat comes from THIS unit's beta_hat, never from self._cwo_ell.
+        s_hat = 0
+        if (
+            self.snd_pact1 and self.pact1_assist
+            and action >= self.n_actions_no_attack and k > 1
+        ):
+            g = float(self._p1_conf[a_id]) * self.pact1_gpol
+            s_hat = _p1_shift_from_ell(g * float(self._p1_ellhat[a_id]), k)
+            if s_hat > 0:
+                cur0 = int(action - self.n_actions_no_attack)
+                w0 = np.where(tgts == cur0)[0]
+                if w0.size:
+                    action = self.n_actions_no_attack + int(
+                        tgts[(int(w0[0]) - s_hat) % k]
+                    )
+        if self.snd_pact1:
+            self._p1_shat[a_id] = s_hat
+
         if (
             self.snd_severity != 0.0
             and action >= self.n_actions_no_attack
             and float(self._cwo_ell[a_id]) > 0.0
         ):
-            tgts = np.where(
-                np.asarray(avail_actions[self.n_actions_no_attack:]) > 0
-            )[0]
-            k = int(tgts.size)
             if k > 1:
                 s = int(round(float(self._cwo_ell[a_id]) * (k - 1)))
                 if s > 0:
@@ -1366,6 +1653,18 @@ class StarCraft2Env(MultiAgentEnv):
                     pos = int(np.where(tgts == cur)[0][0])
                     action = self.n_actions_no_attack + int(tgts[(pos + s) % k])
                     self._cwo_dropped[a_id] = 1.0  # "my shot was deflected" (local feel)
+
+        # --- PACT-1 SENSOR: record the displacement this unit actually suffered.
+        # The unit sees where its shot landed and knows its own s_hat, so it can
+        # reconstruct s -- unprivileged.  s == 0 is recorded too: "no deflection" is a
+        # genuine low-liability reading, and dropping those would bias the estimator
+        # upward.  k is needed because the quantisation depends on it.
+        if self.snd_pact1 and action >= self.n_actions_no_attack and k > 1:
+            ell_true = float(self._cwo_ell[a_id])
+            self._p1_sobs[a_id] = float(
+                int(round(ell_true * (k - 1))) if self.snd_severity != 0.0 else 0
+            )
+            self._p1_kobs[a_id] = k
 
         unit = self.get_unit_by_id(a_id)
         tag = unit.tag
