@@ -56,6 +56,13 @@ _COLS = [
     "ep_len_mean", "actor_std",
     # phase split (does β modulate with the cycle?)
     "beta_peak", "beta_trough", "r_total_peak", "r_total_trough",
+    # --- PACT-1 only (nan under plain PACT) ---
+    # trust_pol  what the POLICY set, before the confidence gate
+    # conf       the estimator's own confidence, from its RLS covariance
+    # cancel     fraction of the disturbance actually removed -- THE headline
+    #            (1 - |d_applied - g*d_hat| / |d_applied|), correctly aligned
+    # beta_err   ||beta_hat - beta_true||, the coupling-tracking error
+    "trust_pol", "conf", "cancel", "beta_err",
 ]
 
 
@@ -105,6 +112,8 @@ class OnPolicyPactRunner(OnPolicyHARunner):
         keys = [
             "payload", "beta", "dbeta", "x2_absmean", "resid", "u_clip",
             "r_total", "r_forward", "r_ctrl", "r_contact", "r_survive",
+            # PACT-1 only; stay empty (-> nan) under plain PACT
+            "trust_pol", "conf", "cancel", "beta_err",
         ]
         acc = {k: [] for k in keys}
         # phase-binned
@@ -151,6 +160,11 @@ class OnPolicyPactRunner(OnPolicyHARunner):
             a["r_ctrl"].append(float(d.get("reward_ctrl", np.nan)))
             a["r_contact"].append(float(d.get("reward_contact", np.nan)))
             a["r_survive"].append(float(d.get("reward_survive", np.nan)))
+            # PACT-1 diagnostics (absent -> nan -> dropped by _m)
+            a["trust_pol"].append(float(d.get("pact1_trust_pol", np.nan)))
+            a["conf"].append(float(d.get("pact1_conf", np.nan)))
+            a["cancel"].append(float(d.get("pact1_cancel_frac", np.nan)))
+            a["beta_err"].append(float(d.get("pact1_beta_err", np.nan)))
             if np.isfinite(pay):
                 ph = "peak" if pay > 0.7 else ("trough" if pay < 0.1 else None)
                 if ph is not None:
@@ -224,6 +238,8 @@ class OnPolicyPactRunner(OnPolicyHARunner):
                 round(self._actor_std(), 5),
                 round(m(a["beta_peak"]), 5), round(m(a["beta_trough"]), 5),
                 round(m(a["r_total_peak"]), 4), round(m(a["r_total_trough"]), 4),
+                round(m(a["trust_pol"]), 4), round(m(a["conf"]), 4),
+                round(m(a["cancel"]), 4), round(m(a["beta_err"]), 5),
             ]
             self._dbg_w.writerow(row)
             self._dbg.flush()

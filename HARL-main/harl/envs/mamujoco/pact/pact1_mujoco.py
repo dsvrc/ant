@@ -422,6 +422,30 @@ class Pact1MujocoMulti(MujocoMulti):
             float(np.mean(np.abs(d_next - d_hat_used)))
             if np.all(np.isfinite(d_next)) else float("nan")
         )
+        # PREDICTION ERROR -- both sides are "what the NEXT action faces", so this is
+        # aligned. (It was previously compared against d_hat_used, the prediction of
+        # what THIS step faced: off by one, and since d(t+1)=0.8d(t)+0.2(...) the
+        # step-to-step change alone put the ratio near 0.5, which read as a broken
+        # compensator when nothing was wrong. cos_x2_dnext was always aligned, which
+        # is why the two columns disagreed.)
+        info0["pact_resid_absmean"] = (
+            float(np.mean(np.abs(d_next - self._d_hat)))
+            if np.all(np.isfinite(d_next)) else float("nan")
+        )
+        # THE NUMBER THAT MATTERS: what the policy actually still feels after
+        # compensation. delivered = clip(a - g*d_hat_used) + d_applied, so the
+        # uncancelled disturbance is d_applied - g*d_hat_used. At perfect prediction
+        # this is (1-g)*|d|, i.e. ~0.11*|d| at g=0.89 -- compare it against
+        # pact1_felt_blind, the same quantity with no compensation at all.
+        d_app = np.asarray(info0.get("pcr_d_applied", np.full(self.n_act, np.nan)),
+                           dtype=np.float64).reshape(-1)
+        g_flat = np.repeat(self._g, self.act_dim_env)
+        if np.all(np.isfinite(d_app)):
+            info0["pact1_felt"] = float(np.mean(np.abs(d_app - g_flat * d_hat_used)))
+            info0["pact1_felt_blind"] = float(np.mean(np.abs(d_app)))
+            info0["pact1_cancel_frac"] = 1.0 - (
+                info0["pact1_felt"] / max(1e-12, info0["pact1_felt_blind"])
+            )
         info0["pact_u_clip"] = float(np.mean(np.abs(pre_clip) > 1.0))
         info0["pact_u_minus_a"] = float(np.sqrt(np.mean((u_flat - a.reshape(-1)) ** 2)))
         info0["pact1_trust"] = float(np.mean(self._g))          # applied = policy*conf
