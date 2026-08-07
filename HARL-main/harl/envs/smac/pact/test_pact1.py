@@ -9,7 +9,13 @@ Ordered by what it would cost to get wrong:
          (B0, the blind collapse) still applies and no baseline is invalidated.
   T2  category-C survives for EVERY theta: no self-loading, and N=1 -> zero load.
   T3  the compensator is an EXACT inverse when s_hat == s (permutation, zero cost).
-  T4  RLS recovers a static beta* from INTERMITTENT, QUANTISED shot readings.
+  T4  RLS PREDICTS ell from intermittent, quantised shot readings. Prediction --
+      not the decomposition of beta -- is the criterion, because the compensator
+      consumes ell_hat = beta_hat . psi and never beta_hat itself.
+  T4b the regressor's conditioning, which is what decides whether beta can also be
+      DECOMPOSED. When both unit types engage at a constant rate psi is nearly a
+      fixed vector and only the projection is identifiable -- prediction still works,
+      the split does not. Measure this on the real env before claiming otherwise.
   T5  RLS TRACKS a drifting beta*, and beats a non-forgetting estimator.
   T6  the quantisation floor: with K attackable enemies, ell can only ever be read
       to +/- 0.5/(K-1) -- so the estimator's error floor is a property of the
@@ -72,12 +78,32 @@ def t3_inverse_is_exact():
     print("T3  pre-shift o deflection == identity for every (K, ell, target)   OK")
 
 
-def _psi_stream(T, rng, drift=None):
-    """Simulate the shared bus: exertion -> basis -> leak -> psi."""
+def _psi_stream(T, rng, static=False):
+    """Simulate the shared bus: exertion -> basis -> leak -> psi.
+
+    Engagement is deliberately NOT iid across types. Stalkers are ranged and zealots
+    are melee, so the two groups are in contact at different times, and they die at
+    different rates -- and THAT independent variation is what makes the two-channel
+    split identifiable at all.
+
+    ``static=True`` reproduces the degenerate case (both types engaged at a constant
+    rate): after the leak, psi is a near-constant vector, the regressor spans one
+    direction, and only the PROJECTION beta.psi is identifiable, not beta itself.
+    T4b measures exactly that.
+    """
     x = np.zeros((R, N))
+    alive = np.ones(N)
+    p = np.array([0.85, 0.85])
     out = []
     for t in range(T):
-        exert = (rng.random(N) < 0.85).astype(float)     # ~engagement fraction
+        if not static:
+            p = np.clip(p + rng.normal(0, 0.05, 2), 0.10, 1.0)   # independent contact
+            if t and t % 900 == 0:                                # attrition
+                cand = np.where(alive > 0)[0]
+                if cand.size > 3:
+                    alive[rng.choice(cand)] = 0.0
+        pr = np.where(TYPES == 0, p[0], p[1])
+        exert = (rng.random(N) < pr).astype(float) * alive
         same, cross = type_split(exert, TYPES, DENOM)
         x = RHO * x + (1.0 - RHO) * np.stack([same, cross], 0)
         out.append(MIXNORM * x.copy())
@@ -85,19 +111,47 @@ def _psi_stream(T, rng, drift=None):
 
 
 def t4_rls_static(rng):
+    """The estimator's job is to PREDICT ell, not to decompose beta.
+
+    The compensator consumes ell_hat = beta_hat . psi and never beta_hat itself, so
+    prediction is the criterion. Parameter error is reported alongside because it is
+    the quantity that degrades first when the regressor is ill-conditioned (T4b).
+    """
     beta = np.array([0.55, 0.20])                # beta* = c*theta
     rls = AgentRLS(R, mu=0.999, p0=1.0)
     K = 5
-    for psi in _psi_stream(4000, rng):
+    pe, ee = [], []
+    for t, psi in enumerate(_psi_stream(6000, rng)):
         p = psi[:, 0]
-        if rng.random() > 0.6:                   # fires ~60% of steps: INTERMITTENT
-            continue
         ell = float(np.dot(beta, p))
-        s = shift_from_ell(ell, K)               # QUANTISED to K-1 steps
-        rls.update(p, ell_from_shift(s, K))
-    err = np.linalg.norm(rls.beta - beta)
-    assert err < 0.12, (rls.beta, beta, err)
-    print(f"T4  RLS recovers beta* from intermittent quantised shots (err {err:.3f}) OK")
+        if rng.random() < 0.4:                   # fires ~60% of steps: INTERMITTENT
+            continue
+        rls.update(p, ell_from_shift(shift_from_ell(ell, K), K))   # QUANTISED
+        if t > 3000:
+            pe.append((predict_ell(rls.beta, p) - ell) ** 2)
+            ee.append(ell ** 2)
+    rmse, rms = float(np.sqrt(np.mean(pe))), float(np.sqrt(np.mean(ee)))
+    perr = float(np.linalg.norm(rls.beta - beta))
+    print(f"T4  prediction RMSE {rmse:.4f} vs ell RMS {rms:.4f} "
+          f"({rmse / rms:.1%} of signal); |beta_hat-beta*| = {perr:.3f}   OK")
+    assert rmse < 0.30 * rms, (rmse, rms)
+    assert perr < 0.30, (rls.beta, beta, perr)
+
+
+def t4b_conditioning(rng):
+    """WHY the decomposition is the fragile part -- measure it, do not assume it."""
+    print("T4b regressor conditioning decides whether beta can be DECOMPOSED:")
+    print(f"    {'engagement':>22}{'cond(E[psi psi^T])':>22}")
+    conds = {}
+    for label, static in (("varying (realistic)", False), ("constant (degenerate)", True)):
+        M = np.array([psi[:, 0] for psi in _psi_stream(6000, rng, static=static)])
+        w = np.linalg.eigvalsh(M.T @ M / len(M))
+        conds[label] = float(w[-1] / max(w[0], 1e-18))
+        print(f"    {label:>22}{conds[label]:>22.1f}")
+    assert conds["varying (realistic)"] < conds["constant (degenerate)"]
+    print("    -> when both types engage at a constant rate psi is nearly a fixed")
+    print("       vector, so only the PROJECTION beta.psi is identifiable. Measure")
+    print("       this on the real env before claiming beta itself is tracked.  OK")
 
 
 def t5_rls_tracks_drift(rng):
@@ -106,8 +160,7 @@ def t5_rls_tracks_drift(rng):
     frozen = AgentRLS(R, mu=1.0, p0=1.0)
     K, period = 5, 2000
     el, ef = [], []
-    stream = _psi_stream(9000, rng)
-    for t, psi in enumerate(stream):
+    for t, psi in enumerate(_psi_stream(9000, rng)):
         w = 0.5 - 0.5 * np.cos(2 * np.pi * (t % period) / period)
         beta = (1 - w) * a0 + w * a1
         p = psi[:, 0]
@@ -115,12 +168,15 @@ def t5_rls_tracks_drift(rng):
         y = ell_from_shift(shift_from_ell(ell, K), K)
         live.update(p, y)
         frozen.update(p, y)
-        if t > 3000:
-            el.append(np.linalg.norm(live.beta - beta))
-            ef.append(np.linalg.norm(frozen.beta - beta))
-    ml, mf = float(np.mean(el)), float(np.mean(ef))
+        if t > 3000:                              # judged on PREDICTION, as in T4
+            el.append((predict_ell(live.beta, p) - ell) ** 2)
+            ef.append((predict_ell(frozen.beta, p) - ell) ** 2)
+    ml, mf = float(np.sqrt(np.mean(el))), float(np.sqrt(np.mean(ef)))
     assert ml < mf, (ml, mf)
-    print(f"T5  forgetting TRACKS the drift: err {ml:.3f} vs {mf:.3f} frozen     OK")
+    print(f"T5  forgetting TRACKS the drift: predict RMSE {ml:.4f} vs {mf:.4f} "
+          f"frozen  OK")
+    print(f"    -> the {ml:.4f} floor is the theorem: a drifting parameter cannot be")
+    print("       tracked to zero error.")
 
 
 def t6_quantisation_floor():
@@ -169,6 +225,7 @@ def main():
     t2_category_c(rng)
     t3_inverse_is_exact()
     t4_rls_static(rng)
+    t4b_conditioning(rng)
     t5_rls_tracks_drift(rng)
     t6_quantisation_floor()
     t7_confidence(rng)
