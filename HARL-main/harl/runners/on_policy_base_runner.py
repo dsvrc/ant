@@ -165,6 +165,16 @@ class OnPolicyBaseRunner:
             self.logger = LOGGER_REGISTRY[args["env"]](
                 args, algo_args, env_args, self.num_agents, self.writter, self.run_dir
             )
+        # NS liveness telemetry for EVERY on-policy arm, blind baselines included.
+        # Pure logging; a complete no-op on envs that publish no pcr_* info keys.
+        # It exists because a silently-inert non-stationarity is invisible in a
+        # blind arm -- and a return that looks GOOD is the failure nobody checks.
+        from harl.common.ns_probe import NSLivenessProbe
+
+        self._ns_probe = NSLivenessProbe(
+            getattr(self, "run_dir", None),
+            report_every=int(self.algo_args["train"]["episode_length"]),
+        )
         if self.algo_args["train"]["model_dir"] is not None:  # restore model
             self.restore()
 
@@ -354,6 +364,12 @@ class OnPolicyBaseRunner:
             rnn_states,  # (n_threads, n_agents, dim)
             rnn_states_critic,  # EP: (n_threads, dim), FP: (n_threads, n_agents, dim)
         ) = data
+
+        # NS liveness (logging only; no-op without pcr_* keys) -- see ns_probe.py
+        probe = getattr(self, "_ns_probe", None)
+        if probe is not None:
+            probe.observe(infos)
+            probe.maybe_report()
 
         dones_env = np.all(dones, axis=1)  # if all agents are done, then env is done
         rnn_states[
@@ -773,3 +789,6 @@ class OnPolicyBaseRunner:
             self.writter.export_scalars_to_json(str(self.log_dir + "/summary.json"))
             self.writter.close()
             self.logger.close()
+        probe = getattr(self, "_ns_probe", None)
+        if probe is not None:
+            probe.close()
