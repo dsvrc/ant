@@ -71,6 +71,8 @@
             "g_bias": 2.2,
             "confidence_gate": true,
             "anchored": true,
+            "throttle": 1.0,
+            "lmax": 0.9,
             "critic_payload": false,
             "gate_abort": false,
             "gate_min_corr": 0.95,

@@ -187,13 +187,34 @@ def predict_load(anchor, waves, beta_hat, rho):
     return rho * np.asarray(anchor, dtype=np.float64) + innov
 
 
-def compensate(a, g, d_hat, offsets):
-    """u_i = clip(a_i - g_i * d_hat_i, -1, 1). g is the per-agent TRUST in [0,1]."""
+def compensate(a, g, d_hat, offsets, ell_hat=None, lmax=0.9):
+    """The channel inverse, trust-weighted.
+
+    The env delivers  (1 - ell)*u + d,  so recovering the intended ``a`` means
+
+        u = (a - d_hat) / (1 - ell_hat)          SUBTRACT, then DIVIDE
+
+    With ``ell_hat=None`` (throttle off) this reduces exactly to the additive
+    inverse u = a - d_hat, so the legacy arm is unchanged.
+
+    ``g`` is the per-agent TRUST in [0,1] and scales BOTH corrections together, so
+    g=0 gives u = clip(a) -- plain HAPPO -- however wrong the estimate is.  The
+    divide is where this channel rails: as ell -> 1 the required u leaves the box,
+    which is the throttle channel's own sigma*.
+    """
     a = np.asarray(a, dtype=np.float64)
     g = np.asarray(g, dtype=np.float64).reshape(-1)
     u = np.empty_like(a)
     for i in range(a.shape[0]):
-        u[i] = a[i] - g[i] * d_hat[offsets[i]:offsets[i + 1]]
+        sl = slice(offsets[i], offsets[i + 1])
+        num = a[i] - g[i] * d_hat[sl]
+        if ell_hat is None:
+            u[i] = num
+        else:
+            # clip the denominator well away from 0: an over-estimated throttle must
+            # never turn the inverse into a division blow-up.
+            den = 1.0 - np.clip(g[i] * ell_hat[sl], 0.0, lmax)
+            u[i] = num / np.maximum(den, 1.0 - lmax)
     return np.clip(u, -1.0, 1.0)
 
 
@@ -255,6 +276,13 @@ class Pact1MujocoMulti(MujocoMulti):
         # gate reliance by the estimator's own covariance while it is still cold
         self.use_conf = bool(cfg.get("confidence_gate", True))
         self.anchored = bool(cfg.get("anchored", True))
+        # Must MATCH the env's ANT_PCR_THROTTLE.  >0 switches on the second, uncancellable
+        # channel: delivered = (1-ell)*tau + d, with ell driven by sum_{j!=i}|tau_j| and
+        # by the SAME hidden beta* = c*theta.  So the method gains NO extra unknowns --
+        # the observable d_meas = d - ell*tau is still linear in beta*, with regressor
+        # psi = X - Y*tau (X = signed accumulator, Y = magnitude accumulator).
+        self.throttle = float(cfg.get("throttle", 0.0))
+        self.lmax = float(cfg.get("lmax", 0.9))
         self.critic_payload = bool(cfg.get("critic_payload", False))  # CTDE arm
         self.freeze_beta = cfg.get("freeze_beta", None)        # ablation: hand-set beta
 
@@ -276,6 +304,12 @@ class Pact1MujocoMulti(MujocoMulti):
         self._d_meas_prev = np.zeros(self.n_act)
         self._waves_prev = np.zeros((self.r, self.n_act))      # regressor at t-1
         self._d_hat = np.zeros(self.n_act)                     # what t+1 will face
+        # throttle-channel state: X = signed accumulator (drives d), Y = magnitude
+        # accumulator (drives ell).  Both run the env's leak on shared peer actions.
+        self._X = np.zeros((self.r, self.n_act))
+        self._Y = np.zeros((self.r, self.n_act))
+        self._psi = np.zeros((self.r, self.n_act))             # X - Y*tau, aligned
+        self._ell_hat = np.zeros(self.n_act)
         self._have_prev = False
         self._payload_cache = 0.0
 
@@ -368,7 +402,9 @@ class Pact1MujocoMulti(MujocoMulti):
 
         # 2) compensate with the CACHED prediction (what this action faces)
         d_hat_used = self._d_hat.copy()
-        u = compensate(a, self._g, d_hat_used, self._offsets)
+        ell_hat_used = self._ell_hat.copy() if self.throttle > 0.0 else None
+        u = compensate(a, self._g, d_hat_used, self._offsets,
+                       ell_hat_used, self.lmax)
         u_flat = u.reshape(-1)
 
         # 3) step
@@ -389,6 +425,38 @@ class Pact1MujocoMulti(MujocoMulti):
                 sl = slice(self._offsets[i], self._offsets[i + 1])
                 self._rls[i].update(self._waves_prev[:, sl].T, y[sl])
 
+        # --- THROTTLE CHANNEL: identify and predict BOTH harms from ONE beta* ------
+        # The sensor reads  d_meas = delivered - tau = d - ell*tau, and with
+        # d = sum_m b_m X_m and ell = sum_m b_m Y_m that is  sum_m b_m (X_m - Y_m*tau)
+        # -- still LINEAR in beta*.  So the extra difficulty adds NO unknowns; it only
+        # removes blind's escape.  psi is formed from the accumulators that produced
+        # THIS step's harm, so it is time-aligned with the reading.
+        if self.throttle > 0.0:
+            if self._have_prev and self.freeze_beta is None:
+                for i in range(self.n_agents):
+                    sl = slice(self._offsets[i], self._offsets[i + 1])
+                    self._rls[i].update(self._psi[:, sl].T, self._d_meas[sl])
+            tau = np.clip(u_flat, -1.0, 1.0)
+            Bt = basis_waveforms(tau, self.B)                      # signed drive
+            Bm = basis_waveforms(np.abs(tau) / max(1, self.n_agents - 1), self.B)
+            self._X = self.rho * self._X + (1.0 - self.rho) * Bt
+            self._Y = self.rho * self._Y + (1.0 - self.rho) * Bm * self.throttle
+            self._psi = self._X - self._Y * tau[None, :]
+            for i in range(self.n_agents):
+                sl = slice(self._offsets[i], self._offsets[i + 1])
+                b_i = (np.full(self.r, float(self.freeze_beta))
+                       if self.freeze_beta is not None else self._rls[i].beta)
+                self._d_hat[sl] = (b_i[:, None] * self._X[:, sl]).sum(0)
+                self._ell_hat[sl] = np.clip(
+                    (b_i[:, None] * self._Y[:, sl]).sum(0), 0.0, self.lmax
+                )
+            self._have_prev = True
+            self._payload_cache = float(info0.get("pcr_payload", self._payload_cache))
+            info0["pact1_ell_hat"] = float(np.mean(self._ell_hat))
+            info0["pact1_ell_true"] = float(info0.get("pcr_ell_mean", np.nan))
+            return self._finish(obs_n, state_n, rewards, dones, infos, avail,
+                                info0, a, u_flat, d_hat_used)
+
         # 6) the basis waveforms this step's EXECUTED torque just created
         waves = basis_waveforms(u_flat, self.B)
 
@@ -405,8 +473,13 @@ class Pact1MujocoMulti(MujocoMulti):
         self._waves_prev = waves
         self._have_prev = True
         self._payload_cache = float(info0.get("pcr_payload", self._payload_cache))
+        return self._finish(obs_n, state_n, rewards, dones, infos, avail,
+                            info0, a, u_flat, d_hat_used)
 
-        # 8) diagnostics (logging only -- none of this reaches the control path)
+    def _finish(self, obs_n, state_n, rewards, dones, infos, avail,
+                info0, a, u_flat, d_hat_used):
+        """Diagnostics + obs/state augmentation, shared by both harm channels.
+        Logging only -- none of this reaches the control path."""
         d_next = np.asarray(info0.get("pcr_d_next", np.full(self.n_act, np.nan)),
                             dtype=np.float64).reshape(-1)
         beta_true = np.asarray(info0.get("pcr_beta_true", np.full(self.r, np.nan)),
@@ -472,5 +545,10 @@ class Pact1MujocoMulti(MujocoMulti):
         self._d_meas_prev = np.zeros(self.n_act)
         self._waves_prev = np.zeros((self.r, self.n_act))
         self._d_hat = np.zeros(self.n_act)
+        # the env zeroes BOTH loads at reset, so both accumulators are stale
+        self._X = np.zeros((self.r, self.n_act))
+        self._Y = np.zeros((self.r, self.n_act))
+        self._psi = np.zeros((self.r, self.n_act))
+        self._ell_hat = np.zeros(self.n_act)
         self._have_prev = False
         return self._augment_obs(obs_n), self._augment_state(state_n), avail
