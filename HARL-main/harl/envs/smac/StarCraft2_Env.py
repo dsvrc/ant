@@ -1089,6 +1089,9 @@ class StarCraft2Env(MultiAgentEnv):
                 "pcr_payload": self._snd_payload,
                 "pcr_load": self._snd_load_mean,
                 "pcr_loadmax": self._snd_load_max,
+                # the severity ACTUALLY APPLIED (after the warmup curriculum), so the
+                # probe can tell "sigma is 0 on purpose" from "the NS is broken"
+                "pcr_severity": self._snd_sigma_applied,
                 "pcr_sat_frac": (
                     self._cwo_diag.get("cwo_drop_frac", 0.0)  # frac of shots deflected
                 ),

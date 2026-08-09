@@ -48,6 +48,7 @@ class NSLivenessProbe:
         self._active = None          # None until the first info with pcr_ keys
         self._warned_inert = False
         self._warned_asleep = False
+        self._warned_warmup = False
         self._w = self._f = None
         if run_dir is not None:
             try:
@@ -56,15 +57,16 @@ class NSLivenessProbe:
                 self._w = csv.writer(self._f)
                 self._w.writerow([
                     "insert", "A_mean", "A_min", "A_max", "d_mean", "d_max",
-                    "sat_frac", "ell_mean", "theta0", "theta1", "theta2",
-                    "n_samples",
+                    "sat_frac", "ell_mean", "severity", "theta0", "theta1",
+                    "theta2", "n_samples",
                 ])
             except Exception:
                 self._w = self._f = None
 
     @staticmethod
     def _fresh():
-        return {"A": [], "d": [], "dmax": [], "sat": [], "ell": [], "th": []}
+        return {"A": [], "d": [], "dmax": [], "sat": [], "ell": [], "sev": [],
+                "th": []}
 
     # ------------------------------------------------------------------ read
     def observe(self, infos):
@@ -83,8 +85,12 @@ class NSLivenessProbe:
             a["d"].append(float(d.get("pcr_load", np.nan)))
             a["dmax"].append(float(d.get("pcr_loadmax", np.nan)))
             a["sat"].append(float(d.get("pcr_sat_frac", np.nan)))
-            # throttle channel: absent (-> nan) when ANT_PCR_THROTTLE=0
+            # throttle channel: absent (-> nan) when the second channel is off
             a["ell"].append(float(d.get("pcr_ell_mean", np.nan)))
+            # the severity ACTUALLY APPLIED this step. Distinguishes "the NS is off
+            # because a warmup curriculum is still ramping" from "the NS is broken" --
+            # without it the probe screams INERT through every warmup.
+            a["sev"].append(float(d.get("pcr_severity", np.nan)))
             th = d.get("pcr_theta")
             if th is not None:
                 a["th"].append(np.asarray(th, dtype=np.float64).reshape(-1))
@@ -110,7 +116,7 @@ class NSLivenessProbe:
 
         A_mean, A_min, A_max = m(a["A"]), m(a["A"], np.min), m(a["A"], np.max)
         d_mean, d_max = m(a["d"]), m(a["dmax"], np.max)
-        sat, ell = m(a["sat"]), m(a["ell"])
+        sat, ell, sev = m(a["sat"]), m(a["ell"]), m(a["sev"])
         th = (np.mean(np.stack(a["th"], 0), axis=0) if a["th"]
               else np.full(3, float("nan")))
         tag = f"step={env_step}" if env_step is not None else f"n={self._total}"
@@ -120,6 +126,7 @@ class NSLivenessProbe:
                 self._total, round(A_mean, 4), round(A_min, 4), round(A_max, 4),
                 round(d_mean, 6), round(d_max, 6), round(sat, 5),
                 round(ell, 5) if np.isfinite(ell) else "",
+                round(sev, 5) if np.isfinite(sev) else "",
                 *[round(float(v), 4) for v in (list(th) + [float("nan")] * 3)[:3]],
                 len(a["d"]),
             ])
@@ -132,25 +139,40 @@ class NSLivenessProbe:
             " theta=[" + " ".join(f"{v:.2f}" for v in np.atleast_1d(th)) + "]"
         )
         ell_s = "" if not np.isfinite(ell) else f" | ell {ell:.4f}"
+        sev_s = "" if not np.isfinite(sev) else f" | sigma {sev:.3f}"
         print(f"[NS] {tag} | A {A_min:.2f}-{A_max:.2f} (mean {A_mean:.2f}) | "
-              f"|d| mean {d_mean:.4f} max {d_max:.4f} | sat {sat:.4f}{ell_s}{th_s}",
-              flush=True)
+              f"|d| mean {d_mean:.4f} max {d_max:.4f} | sat {sat:.4f}"
+              f"{ell_s}{sev_s}{th_s}", flush=True)
 
-        # --- INERT: the disturbance is simply not there ----------------------
-        if d_max < 1e-6 and not self._warned_inert:
+        # --- WARMUP: severity is 0 ON PURPOSE, so |d|=0 is correct ------------
+        # Must be checked BEFORE the inert test.  A curriculum holds sigma at 0 for
+        # its first _WARMUP steps, so a probe that only looks at |d| screams INERT
+        # through the entire warmup and trains the reader to ignore it -- which is
+        # exactly what you do not want from an alarm that later matters.
+        if np.isfinite(sev) and sev <= 1e-9:
+            if not self._warned_warmup:
+                self._warned_warmup = True
+                print(f"[NS][SEVERITY 0] the applied severity is 0, so |d|=0 is CORRECT, "
+                      f"not a fault.\n  Either a warmup curriculum is still ramping or "
+                      f"this arm is a stationary baseline.\n  The disturbance check "
+                      f"resumes automatically once sigma > 0.", flush=True)
+
+        # --- INERT: severity is live but the disturbance is simply not there ---
+        elif d_max < 1e-6 and not self._warned_inert:
             self._warned_inert = True
             print(
                 "\n" + "!" * 78 +
                 "\n[NS][INERT] *** THE NON-STATIONARITY IS NOT BEING APPLIED. ***\n"
-                f"  max |d| over {len(a['d'])} samples is {d_max:.2e}. Every number this\n"
-                "  run produces is a STATIONARY-TASK number; do not compare it to any\n"
-                "  arm that ran with the NS live. Check, in this order:\n"
-                "    1. the [DIAG ENV] banner at the top of this log -- does SEVERITY\n"
-                "       match what you passed? (a hardcoded literal in the env file\n"
-                "       silently ignores ANT_PCR_SEVERITY)\n"
-                "    2. ANT_PCR_MASK -- 'off' zeroes the coupling entirely\n"
-                "    3. is gym/envs/mujoco/ant.py actually the deployed file, and is\n"
-                "       there a stale __pycache__/ant.cpython-*.pyc beside it?\n"
+                f"  Applied severity is {sev:.3f} (non-zero), yet max |d| over "
+                f"{len(a['d'])} samples\n  is {d_max:.2e}. Every number this run "
+                "produces is a STATIONARY-TASK number;\n  do not compare it to any arm "
+                "that ran with the NS live. Check, in order:\n"
+                "    1. the env banner at the top of this log -- does the resolved\n"
+                "       SEVERITY match what you passed? (a hardcoded literal in the env\n"
+                "       file silently ignores the severity environment variable)\n"
+                "    2. the channel mask -- an 'off' setting zeroes the coupling\n"
+                "    3. is the env file you edited actually the DEPLOYED one, and is\n"
+                "       there a stale __pycache__/*.pyc sitting beside it?\n"
                 + "!" * 78 + "\n", flush=True)
 
         # --- ASLEEP: wired up, but the driver never woke during this window ---
