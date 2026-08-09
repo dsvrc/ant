@@ -56,14 +56,15 @@ class NSLivenessProbe:
                 self._w = csv.writer(self._f)
                 self._w.writerow([
                     "insert", "A_mean", "A_min", "A_max", "d_mean", "d_max",
-                    "sat_frac", "theta0", "theta1", "theta2", "n_samples",
+                    "sat_frac", "ell_mean", "theta0", "theta1", "theta2",
+                    "n_samples",
                 ])
             except Exception:
                 self._w = self._f = None
 
     @staticmethod
     def _fresh():
-        return {"A": [], "d": [], "dmax": [], "sat": [], "th": []}
+        return {"A": [], "d": [], "dmax": [], "sat": [], "ell": [], "th": []}
 
     # ------------------------------------------------------------------ read
     def observe(self, infos):
@@ -82,6 +83,8 @@ class NSLivenessProbe:
             a["d"].append(float(d.get("pcr_load", np.nan)))
             a["dmax"].append(float(d.get("pcr_loadmax", np.nan)))
             a["sat"].append(float(d.get("pcr_sat_frac", np.nan)))
+            # throttle channel: absent (-> nan) when ANT_PCR_THROTTLE=0
+            a["ell"].append(float(d.get("pcr_ell_mean", np.nan)))
             th = d.get("pcr_theta")
             if th is not None:
                 a["th"].append(np.asarray(th, dtype=np.float64).reshape(-1))
@@ -107,7 +110,7 @@ class NSLivenessProbe:
 
         A_mean, A_min, A_max = m(a["A"]), m(a["A"], np.min), m(a["A"], np.max)
         d_mean, d_max = m(a["d"]), m(a["dmax"], np.max)
-        sat = m(a["sat"])
+        sat, ell = m(a["sat"]), m(a["ell"])
         th = (np.mean(np.stack(a["th"], 0), axis=0) if a["th"]
               else np.full(3, float("nan")))
         tag = f"step={env_step}" if env_step is not None else f"n={self._total}"
@@ -116,14 +119,21 @@ class NSLivenessProbe:
             self._w.writerow([
                 self._total, round(A_mean, 4), round(A_min, 4), round(A_max, 4),
                 round(d_mean, 6), round(d_max, 6), round(sat, 5),
+                round(ell, 5) if np.isfinite(ell) else "",
                 *[round(float(v), 4) for v in (list(th) + [float("nan")] * 3)[:3]],
                 len(a["d"]),
             ])
             self._f.flush()
 
-        th_s = "" if not a["th"] else f" theta=[{th[0]:.2f} {th[1]:.2f} {th[2]:.2f}]"
+        # theta has r components and r is env-specific: 3 on Ant (hip/ankle/cross),
+        # 2 on SMAC (same-type/cross-type).  Format whatever arrived -- indexing a
+        # fixed th[2] here crashed every SMAC run.
+        th_s = "" if not a["th"] else (
+            " theta=[" + " ".join(f"{v:.2f}" for v in np.atleast_1d(th)) + "]"
+        )
+        ell_s = "" if not np.isfinite(ell) else f" | ell {ell:.4f}"
         print(f"[NS] {tag} | A {A_min:.2f}-{A_max:.2f} (mean {A_mean:.2f}) | "
-              f"|d| mean {d_mean:.4f} max {d_max:.4f} | sat {sat:.4f}{th_s}",
+              f"|d| mean {d_mean:.4f} max {d_max:.4f} | sat {sat:.4f}{ell_s}{th_s}",
               flush=True)
 
         # --- INERT: the disturbance is simply not there ----------------------

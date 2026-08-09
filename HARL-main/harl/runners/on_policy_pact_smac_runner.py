@@ -93,6 +93,9 @@ _COLS = [
     # p1_obs_frac   fraction of units that got a usable reading this step
     "p1_ellhat", "p1_conf", "p1_beta_err", "p1_raw_shift", "p1_net_shift",
     "p1_obs_frac",
+    # p1_cancel  fraction of the deflection actually cancelled -- THE headline,
+    #            the direct analogue of Ant's pact1_cancel_frac.
+    "p1_cancel",
 ]
 
 
@@ -149,7 +152,8 @@ class OnPolicyPactSmacRunner(OnPolicyHARunner):
                 "fire", "avail", "hold", "thru", "fire_hi", "fire_lo",
                 "r", "cos", "gate_cos",
                 # PACT-1 (absent -> nan -> dropped by _m)
-                "p1_ellhat", "p1_conf", "p1_beta_err", "p1_raw", "p1_net", "p1_obs"]
+                "p1_ellhat", "p1_conf", "p1_beta_err", "p1_raw", "p1_net", "p1_obs",
+                "p1_cancel"]
         acc = {k: [] for k in keys}
         for ph in ("peak", "trough"):
             for k in ("ell", "drop", "fire", "hold", "thru", "fire_hi", "fire_lo"):
@@ -194,6 +198,7 @@ class OnPolicyPactSmacRunner(OnPolicyHARunner):
             a["p1_raw"].append(float(d.get("p1_raw_shift", np.nan)))
             a["p1_net"].append(float(d.get("p1_net_shift", np.nan)))
             a["p1_obs"].append(float(d.get("p1_obs_frac", np.nan)))
+            a["p1_cancel"].append(float(d.get("p1_cancel", np.nan)))
             # leak gate (smacv2/CWD): only counts where there is real waveform signal
             cos = float(d.get("pact_cos", np.nan))
             x2l = float(d.get("pact_x2load", np.nan))
@@ -257,7 +262,7 @@ class OnPolicyPactSmacRunner(OnPolicyHARunner):
             (self._m(self._ep_lens) if self._ep_lens else float("nan")),
             gate_cos, n_gate,
             m(a["p1_ellhat"]), m(a["p1_conf"]), m(a["p1_beta_err"]),
-            m(a["p1_raw"]), m(a["p1_net"]), m(a["p1_obs"]),
+            m(a["p1_raw"]), m(a["p1_net"]), m(a["p1_obs"]), m(a["p1_cancel"]),
         ]
         if self._dbg_w is not None:
             self._dbg_w.writerow([round(v, 5) if isinstance(v, float) else v for v in row])

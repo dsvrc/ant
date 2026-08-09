@@ -299,11 +299,45 @@ _ORACLE = os.environ.get("SMAC_SND_ORACLE", "0").lower() not in ("0", "false", "
 # (Set SMAC_SND_DEPHASE=0 to reproduce the old in-phase behaviour.)
 _DEPHASE = os.environ.get("SMAC_SND_DEPHASE", "1").lower() not in ("0", "false", "", "no")
 
-# Exertion Phi: what the OTHERS do that loads your bus.  "engage" = they are in contact
-# (alive with an enemy in range); "fire" = they pulled the trigger.  See _snd_step --
-# trigger-pulls let the team switch the NS off by not shooting, which it duly learned
-# to do instead of learning to compensate.
-_PHI_ENGAGE = os.environ.get("SMAC_SND_PHI", "engage").lower() != "fire"
+# ###########################################################################
+# ###  EXERTION Phi -- what the OTHERS do that loads your bus.             ###
+# ###########################################################################
+# This is THE design decision that determines whether a blind baseline can escape
+# the non-stationarity through the CONTROL space instead of solving it.  Three
+# settings, in increasing order of how hard they are to dodge:
+#
+#   "fire"    Phi_j = j pulled the trigger.  ESCAPABLE and measured: the team simply
+#             fires less, which switches the NS partly off (fire_frac 0.82 -> 0.50,
+#             ep_len 50 -> 86, win capped at 0.44).  It learned to stop fighting
+#             instead of to re-aim.
+#
+#   "engage"  Phi_j = j is alive AND has an enemy in range.  Closes the trigger
+#             hatch but opens a slower one: the squad can DISENGAGE -- back off so
+#             nothing is in range.  Also measured (fire_avail 0.89 -> 0.22, ep_len
+#             50 -> 141), and the runner prints [PACT][DISENGAGED] when it happens.
+#
+#   "alive"   Phi_j = j is alive.  *** DEFAULT.  UNCANCELLABLE. ***  Every powered
+#             unit draws from the shared bus whatever it chooses to do, so the only
+#             way to lower the load is to LOSE UNITS -- which costs the battle
+#             directly.  There is no behavioural dodge left; the sole remaining
+#             mitigation is the intended one, compensate the deflection.
+#
+# This is the exact analogue of the fix Ant needed.  There, the coupling read a
+# SIGNED torque sum, so an anti-symmetric gait shrank it for free -- measured, blind
+# halved its own disturbance over training (|d| 0.086 -> 0.044 at matched driver
+# level).  Keying the load to something the team cannot re-shape is what made blind
+# actually fail.  Same disease, same cure.
+#
+# NOTE ON IDENTIFIABILITY.  "alive" does not make the coupling constant: 3s5z is 3
+# stalkers + 5 zealots, and the two types die at different rates, so B_same and
+# B_cross keep varying INDEPENDENTLY through attrition.  That is precisely the
+# regime test_pact1.py's T4b measures as well-conditioned; a constant-engagement
+# process is the degenerate one.
+_PHI = os.environ.get("SMAC_SND_PHI", "alive").lower()
+assert _PHI in ("alive", "engage", "fire"), (
+    f"SMAC_SND_PHI must be alive|engage|fire (got {_PHI!r})"
+)
+_PHI_ENGAGE = _PHI == "engage"   # kept so old comparisons/scripts still read right
 
 # ###########################################################################
 # ###  PACT-1 HARDENING -- the interference SPLIT is unknown.  DEFAULT OFF. ##
@@ -1046,6 +1080,21 @@ class StarCraft2Env(MultiAgentEnv):
                 "snd_payload": self._snd_payload,  # A(t), the exogenous engagement driver
                 "snd_load": self._snd_load_mean,   # mean drop prob ell over live units
                 "snd_loadmax": self._snd_load_max,  # max drop prob over units
+                # --- pcr_* aliases so harl/common/ns_probe.py works on SMAC too. ---
+                # The probe attaches to EVERY on-policy arm, blind included, which is
+                # the point: a PACT arm writes pact_debug.csv and shows its own
+                # telemetry, but a blind baseline writes nothing -- so a silently
+                # inert NS is invisible in exactly the arm you most need to trust.
+                # That hole is what hid an inert disturbance on Ant for a full run.
+                "pcr_payload": self._snd_payload,
+                "pcr_load": self._snd_load_mean,
+                "pcr_loadmax": self._snd_load_max,
+                "pcr_sat_frac": (
+                    self._cwo_diag.get("cwo_drop_frac", 0.0)  # frac of shots deflected
+                ),
+                "pcr_theta": (
+                    self._p1_theta if self.snd_pact1 else _P1THETA_LEGACY
+                ),
                 # neutral PACT keys read by OnPolicyPactSmacRunner (the smacv2 env emits
                 # the same names, so one runner serves both):
                 "pact_payload": self._snd_payload,  # driver A (>0.3 = "engaged" filter)
@@ -1198,10 +1247,21 @@ class StarCraft2Env(MultiAgentEnv):
         print(
             f"[NS] SMAC CTI  severity={self.snd_severity}  mode={mode}  "
             f"curriculum={curr}  eval={self.snd_eval}  dephase={int(_DEPHASE)}  "
-            f"phi={'engage' if _PHI_ENGAGE else 'fire'}  knee={_KNEE} lmax={_LMAX}"
+            f"phi={_PHI}  knee={_KNEE} lmax={_LMAX}"
             f"   (severity 0 == stock SMAC)",
             flush=True,
         )
+        if _PHI == "alive":
+            print("[NS] phi=alive -> the load is UNCANCELLABLE: a unit loads the bus "
+                  "just by being alive,\n     so the team cannot dodge the NS by "
+                  "firing less or disengaging. The only\n     remaining mitigation is "
+                  "to compensate the deflection.", flush=True)
+        else:
+            print(f"[NS] *** WARNING: phi={_PHI} leaves a behavioural ESCAPE open "
+                  f"({'stop shooting' if _PHI == 'fire' else 'disengage'}), which a "
+                  f"blind\n     baseline will find instead of learning to compensate. "
+                  f"Use phi=alive unless you are\n     deliberately measuring the "
+                  f"escape.", flush=True)
         if self.snd_severity > 0.0:
             print(
                 f"[NS] @ driver peak, at a stationary team's measured load "
@@ -1338,7 +1398,24 @@ class StarCraft2Env(MultiAgentEnv):
             "p1_raw_shift": float(
                 np.mean(np.abs(self._p1_sobs[fired]))
             ) if fired.any() else 0.0,
+            # THE headline: fraction of the deflection actually cancelled by the
+            # re-aim.  Mirrors Ant's pact1_cancel_frac exactly, including the guard:
+            # when the driver is at its trough the raw shift is genuinely ~0, so the
+            # ratio is meaningless.  Return NaN, which the runner's _m() drops -- an
+            # epsilon floor there produced a -1011 on Ant that poisoned the column
+            # average until it was caught.
+            "p1_cancel": self._pact1_cancel(fired),
         }
+
+    def _pact1_cancel(self, fired):
+        """1 - |s - s_hat| / |s|, over units that actually took a shot with K>1."""
+        if not fired.any():
+            return float("nan")
+        raw = float(np.mean(np.abs(self._p1_sobs[fired])))
+        if raw <= 1e-3:
+            return float("nan")
+        net = float(np.mean(np.abs(self._p1_sobs[fired] - self._p1_shat[fired])))
+        return 1.0 - net / raw
 
     def _snd_grow_spaces(self):
         """Grow the declared obs/state sizes by the append: each agent's obs gets its
@@ -1525,7 +1602,13 @@ class StarCraft2Env(MultiAgentEnv):
         # left is the intended one -- compensate the deflection.  Still category-C:
         # a sum over j != i that is empty at N=1, and a unit never loads its own bus.
         # (Set SMAC_SND_PHI=fire to restore the old trigger-pull exertion.)
-        if _PHI_ENGAGE:
+        if _PHI == "alive":
+            # UNCANCELLABLE: a powered unit loads the bus whatever it does.  The only
+            # way down is to lose units, which costs the battle -- no behavioural
+            # dodge remains.  (Ant's analogue: key the load to |tau|, not to signed
+            # tau, so an anti-symmetric gait cannot null it.)
+            exert = alive.astype(np.float32)
+        elif _PHI_ENGAGE:
             exert = np.where(alive, self._cwo_can_fire, 0.0).astype(np.float32)
         else:
             exert = fire

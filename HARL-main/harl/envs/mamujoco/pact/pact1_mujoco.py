@@ -512,12 +512,26 @@ class Pact1MujocoMulti(MujocoMulti):
         # pact1_felt_blind, the same quantity with no compensation at all.
         d_app = np.asarray(info0.get("pcr_d_applied", np.full(self.n_act, np.nan)),
                            dtype=np.float64).reshape(-1)
-        g_flat = np.repeat(self._g, self.act_dim_env)
+        ell_app = np.asarray(info0.get("pcr_ell_applied", np.zeros(self.n_act)),
+                             dtype=np.float64).reshape(-1)
+        a_flat = a.reshape(-1)
         if np.all(np.isfinite(d_app)):
-            info0["pact1_felt"] = float(np.mean(np.abs(d_app - g_flat * d_hat_used)))
-            info0["pact1_felt_blind"] = float(np.mean(np.abs(d_app)))
-            info0["pact1_cancel_frac"] = 1.0 - (
-                info0["pact1_felt"] / max(1e-12, info0["pact1_felt_blind"])
+            # What the policy actually still feels: intended `a` vs DELIVERED.  The
+            # env delivers (1-ell)*u + d, so this covers BOTH channels -- the previous
+            # version ignored ell entirely and therefore under-reported whenever the
+            # throttle was on.
+            delivered = (1.0 - ell_app) * u_flat + d_app
+            felt = float(np.mean(np.abs(delivered - a_flat)))
+            # the same quantity with NO compensation (u would have been a)
+            blind = float(np.mean(np.abs(d_app - ell_app * a_flat)))
+            info0["pact1_felt"] = felt
+            info0["pact1_felt_blind"] = blind
+            # Guard hard, not with an epsilon: at the driver trough the disturbance is
+            # genuinely ~0, so the ratio is meaningless and a 1e-12 floor turned it
+            # into -1011, which then poisoned the column average.  NaN is dropped by
+            # the runner's _m(); a fake number is not.
+            info0["pact1_cancel_frac"] = (
+                1.0 - felt / blind if blind > 1e-3 else float("nan")
             )
         info0["pact_u_clip"] = float(np.mean(np.abs(pre_clip) > 1.0))
         info0["pact_u_minus_a"] = float(np.sqrt(np.mean((u_flat - a.reshape(-1)) ** 2)))
