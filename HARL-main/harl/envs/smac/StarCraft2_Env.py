@@ -1431,7 +1431,20 @@ class StarCraft2Env(MultiAgentEnv):
             # [ell_hat_i, beta_hat_i (r), conf_i, last ell_meas_i] -- the estimator's
             # state, all of it computed from shared engagement + this unit's own shots
             add_obs = 1 + _P1R + 1 + 1
-            add_state = add_obs * self.n_agents + (1 if self.pact1_ctde else 0)
+            # *** THE STATE GETS AGGREGATES, NOT PER-AGENT COPIES. ***
+            # HARL's MLPBase applies nn.LayerNorm(obs_dim), which normalises ACROSS
+            # the feature dimension -- so appended features do not merely add inputs,
+            # they shift the mean/std that every OTHER feature is normalised by.
+            # Appending add_obs*n_agents = 40 dims to the EP state was ~20-30% of the
+            # critic's input, and during a severity-0 warmup nearly all of it is
+            # identically zero: it shrinks every real feature and injects a constant
+            # offset into 40 units. Measured cost on 3s5z: PACT-1 sat at win 0.000
+            # through 1.1M while blind, on the byte-identical stationary task, reached
+            # 0.24.
+            # The per-agent values are near-redundant anyway (x2_i differs across
+            # agents only by the excluded own term, <= (1-RHO)/(N-1) = 0.021), so the
+            # aggregate carries essentially the same information at 1/8 the distortion.
+            add_state = add_obs + (1 if self.pact1_ctde else 0)
         elif self.snd_pact:
             add_obs = 1 + (2 if self.snd_pact_feedback else 0)  # x2 [, x3_jam, x3_try]
             add_state = add_obs * self.n_agents + (1 if self.snd_pact_ctde else 0)
@@ -1491,7 +1504,11 @@ class StarCraft2Env(MultiAgentEnv):
             np.append(np.asarray(o, dtype=np.float32), per_agent[i]).astype(np.float32)
             for i, o in enumerate(local_obs)
         ]
-        g = per_agent.flatten()
+        if self.snd_pact1:
+            # aggregate, not per-agent copies -- see _snd_grow_spaces for why
+            g = per_agent.mean(axis=0).astype(np.float32)
+        else:
+            g = per_agent.flatten()
         if (self.snd_pact and self.snd_pact_ctde) or (self.snd_pact1 and self.pact1_ctde):
             g = np.append(g, np.float32(self._snd_payload))
         global_state = [
