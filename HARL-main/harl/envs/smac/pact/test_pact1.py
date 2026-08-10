@@ -216,6 +216,79 @@ def t8_theta_bounded():
     print("    the legacy env exactly.")
 
 
+def t9_trace_confidence_disarms(rng):
+    """*** THE BUG THAT KILLED THE 3s5z RUN, reproduced in 20 lines of numpy. ***
+
+    RLS with forgetting divides P by mu on EVERY update, so any direction the
+    regressor does not excite grows without bound.  On SMAC the regressor is
+    near-degenerate by construction (T4b), so tr(P) -- and therefore the ORIGINAL
+    confidence() -- decays monotonically even while the prediction beta_hat.psi is
+    perfect.  get_agent_action arms the compensator only when conf >= conf_thresh
+    (0.5 by default), so a long enough run DISARMS a working compensator and PACT-1
+    silently degenerates to blind-plus-dead-features.
+
+    confidence_pred() is keyed to psi^T P psi -- the variance of the quantity the
+    re-aim actually consumes -- so it does not decay with the unexcited direction.
+    """
+    beta = np.array([0.55, 0.20])
+    tr_rls = AgentRLS(R, mu=0.995, p0=1.0)
+    pr_rls = AgentRLS(R, mu=0.995, p0=1.0)
+    last_psi = None
+    for psi in _psi_stream(8000, rng, static=True):   # the degenerate SMAC regime
+        p = psi[:, 0]
+        y = float(np.dot(beta, p))
+        tr_rls.update(p, y)
+        pr_rls.update(p, y)
+        last_psi = p
+    c_trace = tr_rls.confidence()
+    c_pred = pr_rls.confidence_pred(last_psi)
+    err = abs(predict_ell(pr_rls.beta, last_psi) - float(np.dot(beta, last_psi)))
+    print(f"T9  degenerate regressor, 8000 updates: prediction error {err:.4f}")
+    print(f"    trace confidence {c_trace:.3f}  <-- decays, DISARMS the compensator")
+    print(f"    pred  confidence {c_pred:.3f}  <-- tracks what the re-aim uses  OK")
+    assert err < 0.05, err                       # the prediction is fine ...
+    assert c_trace < 0.5, c_trace                # ... yet the old gate has closed
+    assert c_pred > 0.85, c_pred                 # ... and the new one has not
+    print("    -> a gate on tr(P) closes on an estimator that is predicting")
+    print("       perfectly. That is why pact1_conf_mode defaults to 'pred'.")
+
+
+def t10_null_warmup_poisons(rng):
+    """*** WHY THE ESTIMATOR IS FROZEN AT SEVERITY 0 (pact1_warmup_freeze). ***
+
+    During a severity-0 warmup every deflection reading is y == 0 with psi != 0.
+    That is the channel being switched OFF, not evidence about beta*.  Fed to RLS it
+    still shrinks/inflates P, so the confidence readout wanders -- and the appended
+    obs block stops being constant, which is exactly the warmup confound that makes
+    the PACT arm no longer input-equivalent to blind on a byte-identical task.
+    Frozen, P is untouched: conf is exactly 1/(1+r) forever and the block is
+    constant.
+    """
+    live = AgentRLS(R, mu=0.995, p0=1.0)
+    frozen = AgentRLS(R, mu=0.995, p0=1.0)
+    cold = 1.0 / (1.0 + R)
+    swing_live = 0.0
+    swing_frozen = 0.0
+    last_psi = None
+    for psi in _psi_stream(8000, rng, static=True):
+        p = psi[:, 0]
+        live.update(p, 0.0)                       # sigma == 0 -> every reading is 0
+        last_psi = p                              # `frozen` is simply never updated
+        swing_live = max(swing_live, abs(live.confidence() - cold),
+                         abs(live.confidence_pred(p) - cold))
+        swing_frozen = max(swing_frozen, abs(frozen.confidence() - cold),
+                           abs(frozen.confidence_pred(p) - cold))
+    print(f"T10 severity-0 warmup, 8000 null readings (y == 0, psi != 0):")
+    print(f"    unfrozen: confidence wandered up to {swing_live:.3f} off the "
+          f"{cold:.3f} cold prior")
+    print(f"    frozen:   confidence moved {swing_frozen:.1e} -- pinned exactly  OK")
+    assert swing_live > 0.05, swing_live          # the null data DID move the gate
+    assert swing_frozen < 1e-12, swing_frozen     # frozen: constant for every psi
+    print("    -> frozen, BOTH confidence forms sit exactly on the cold prior for")
+    print("       any psi, so the appended block is constant and the arm is")
+    print("       input-equivalent to blind for the whole warmup.")
+
+
 def main():
     print("=" * 72)
     print("SMAC PACT-1 ARITHMETIC CERTIFICATE (pure numpy, no StarCraft II)")
@@ -230,6 +303,8 @@ def main():
     t6_quantisation_floor()
     t7_confidence(rng)
     t8_theta_bounded()
+    t9_trace_confidence_disarms(rng)
+    t10_null_warmup_poisons(rng)
     print("=" * 72)
     print("ALL SMAC PACT-1 TESTS PASSED")
     print("=" * 72)

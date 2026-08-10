@@ -155,8 +155,37 @@ class AgentRLS:
     def confidence(self):
         """Self-reported trust in [0,1] from the covariance: 1/(1+r) when cold,
         -> 1 as P shrinks. The estimator's own uncertainty IS the trust prior, so
-        early reliance ramps in without a hand-set warmup."""
+        early reliance ramps in without a hand-set warmup.
+
+        *** THIS IS THE PARAMETER confidence and it is the WRONG GATE for a
+        compensator.  Use confidence_pred() unless you specifically want it. ***
+        tr(P) is dominated by the LEAST excited direction, and RLS with forgetting
+        inflates every unexcited direction by 1/mu on every update, without bound.
+        On SMAC the regressor is near-degenerate by construction -- with Phi=alive
+        B_same and B_cross both track squad size, so E[psi psi^T] is ill-conditioned
+        (guide III.6: "only the projection beta*.psi is identifiable, not the
+        split") -- so tr(P) GROWS over a run even while the prediction beta_hat.psi
+        stays good, and any gate keyed to it eventually disarms an estimator that is
+        working perfectly.  Measured on the 3s5z PACT-1 run: conf 0.75 -> 0.44 over
+        1.8M steps and still falling, i.e. on track to sit far below the 0.5 arming
+        threshold by the time the curriculum switched the NS on at 6M."""
         return 1.0 / (1.0 + float(np.trace(self.P)) / max(1e-9, self.p0))
+
+    def confidence_pred(self, psi):
+        """Trust in the quantity the compensator actually uses: the PREDICTION
+        beta_hat . psi, whose posterior variance is psi^T P psi -- not the parameter
+        vector, whose unexcited directions are irrelevant to it.
+
+        Scaled to keep exactly the semantics (and therefore the threshold) of
+        confidence(): cold P = p0*I gives 1/(1+r), and it rises to 1 as the variance
+        along psi collapses.  Falls back to the trace form when psi ~ 0, where there
+        is nothing to predict anyway."""
+        psi = np.asarray(psi, dtype=np.float64).reshape(-1)
+        n2 = float(psi @ psi)
+        if n2 <= 1e-12:
+            return self.confidence()
+        v = float(psi @ (self.P @ psi)) / n2          # variance per unit direction
+        return 1.0 / (1.0 + self.r * v / max(1e-9, self.p0))
 
 
 # ---------------------------------------------------------------- channel

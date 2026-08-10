@@ -582,6 +582,8 @@ class StarCraft2Env(MultiAgentEnv):
         self._cwo_dropped = np.zeros(self.n_agents, dtype=np.float32)  # shots jammed this step
         self._cwo_can_fire = np.zeros(self.n_agents, dtype=np.float32)  # attack was AVAILABLE
         self._cwo_diag = {}                                        # per-step debug telemetry
+        self._cwo_regen_pay = 0.0    # this step's shield-regeneration pay (diagnostic)
+        self._cwo_reward_raw = 0.0   # delta_enemy + delta_deaths BEFORE abs()
         self._snd_sigma_applied = 0.0                             # curriculum severity this step
         self._cwo_rng = np.random.RandomState(0)  # weapon-jam RNG; re-seeded in seed()
         self._pact1_init_state()
@@ -1206,6 +1208,45 @@ class StarCraft2Env(MultiAgentEnv):
         #   shift -- partial re-aim is useless or harmful (Phase 1: beta=0.5 scored
         #   BELOW blind). Cold prior is 1/(1+r) = 0.33, so 0.5 means "wait until the
         #   covariance has roughly halved", then compensate fully.
+        # *** FREEZE THE ESTIMATOR WHILE THE APPLIED SEVERITY IS 0.  DEFAULT ON. ***
+        # During a sigma=0 warmup every deflection reading is y == 0 with psi != 0.
+        # That is NOT information about beta*; it is the channel being switched off.
+        # Feeding it to RLS does two harmful things:
+        #   (1) it SHRINKS P along psi, so `conf` climbs (measured 0.33 -> 0.75 by 80k
+        #       steps on 3s5z) and the compensator ARMS itself on a beta_hat that was
+        #       fitted to an absent channel -- then, once the ramp starts, it re-aims
+        #       by a lagging integer shift, which on a PERMUTATION channel is measured
+        #       to be WORSE than not compensating at all (Phase 1: beta=0.5 -> 12.5 vs
+        #       13.0 for beta=0; guide III.5);
+        #   (2) `conf` becomes the ONLY time-varying appended feature during the
+        #       warmup, so the arm is no longer input-identical to blind on a task
+        #       that is byte-identical to stock SMAC -- which is exactly the warmup
+        #       confound guide II.6 says destroys the comparison.
+        # Frozen, P stays at p0*I, so conf == 1/(1+r) exactly and the whole appended
+        # block is a CONSTANT vector -- functionally equivalent to no append at all --
+        # and the estimator enters the ramp genuinely cold (conf 0.33 < thresh 0.5),
+        # which is the designed "do not compensate before you have data" behaviour.
+        # Set 0 to ablate (reproduces the old, poisoned behaviour).
+        self.pact1_warmup_freeze = int(a.get("pact1_warmup_freeze", 1))
+        # *** WHICH CONFIDENCE GATES THE COMPENSATOR.  DEFAULT "pred". ***
+        #   "pred"  -> 1/(1 + r*psi^T P psi/(p0*||psi||^2)): uncertainty in the
+        #              PREDICTION beta_hat.psi, which is the only thing the re-aim
+        #              uses.  Same range and same threshold semantics as "trace"
+        #              (cold = 1/(1+r), converged -> 1).
+        #   "trace" -> the original 1/(1 + tr(P)/p0).  Dominated by the LEAST excited
+        #              direction, which RLS-with-forgetting inflates by 1/mu on every
+        #              update, unbounded.  On SMAC the regressor is near-degenerate by
+        #              construction (Phi=alive makes B_same and B_cross both track
+        #              squad size -- guide III.6), so tr(P) grows over a run even
+        #              while the prediction stays good, and the gate eventually
+        #              DISARMS a working compensator.  Measured: conf 0.75 -> 0.44
+        #              over 1.8M steps and still falling, against a 0.5 threshold.
+        # Watch p1_psi_cond in pact_debug.csv: if it is large, "trace" is guaranteed
+        # to decay to zero and "pred" is the only readout that means anything.
+        self.pact1_conf_mode = str(a.get("pact1_conf_mode", "pred")).lower()
+        assert self.pact1_conf_mode in ("pred", "trace"), (
+            f"pact1_conf_mode must be 'pred' or 'trace' (got {self.pact1_conf_mode!r})"
+        )
         self.pact1_ctde = int(a.get("pact1_ctde", 0))             # true A -> critic only
         # de-phasing: this env's starting point on the driver cycle, in [0,1).  Set by
         # make_train_env / make_eval_env from the worker rank so the ensemble tiles the
@@ -1236,7 +1277,10 @@ class StarCraft2Env(MultiAgentEnv):
         elif self.snd_pact1:
             mode = "PACT-1 (beta_hat estimated online%s)" % (
                 ", env pre-shifts" if self.pact1_assist else ", obs only"
-            ) + (" +CTDE" if self.pact1_ctde else "")
+            ) + (" +CTDE" if self.pact1_ctde else "") + (
+                ", RLS FROZEN at sigma=0" if self.pact1_warmup_freeze
+                else ", RLS RUNS at sigma=0 (WARMUP CONFOUND -- see pact1_warmup_freeze)"
+            )
         elif self.snd_pact:
             mode = "PACT (computed x2%s in obs+state)" % (
                 "+x3" if self.snd_pact_feedback else ""
@@ -1320,6 +1364,18 @@ class StarCraft2Env(MultiAgentEnv):
             _PACT1_SEED, _PACT1_RADIUS, _PACT1_CONC, _P1R
         )
         self._p1_theta = _P1THETA_LEGACY.copy()
+        # The severity that produced the ell currently sitting in self._cwo_ell, i.e.
+        # the one the NEXT batch of sensor readings will be measuring.  The warmup
+        # freeze gates on THIS, not on the current step's sigma, so the gate is exact
+        # across the ramp boundary instead of off by one step.
+        self._p1_sigma_ell = 0.0
+        self._p1_frozen = 0.0        # 1 while the estimator is frozen (diagnostic)
+        self._p1_n_upd = 0           # RLS updates actually applied, this instance
+        # Running Gram of the regressor, for cond(E[psi psi^T]) -- guide III.6 says
+        # report it before claiming theta is DECOMPOSED rather than merely predicted.
+        # SMAC with near-constant engagement is the ill-conditioned case.
+        self._p1_gram = np.zeros((_P1R, _P1R))
+        self._p1_gram_n = 0
 
     def _pact1_theta(self):
         """theta(t): how the squad's emissions split across the two channels.
@@ -1339,6 +1395,20 @@ class StarCraft2Env(MultiAgentEnv):
             if u is not None:
                 self._p1_types[j] = int(u.unit_type)
 
+    def _pact1_refresh_conf(self):
+        """Copy beta_hat and the self-confidence out of the per-agent RLS objects.
+
+        The confidence is evaluated along THIS unit's current regressor when
+        pact1_conf_mode == "pred" -- see the knob for why tr(P) is the wrong gate on
+        a near-degenerate regressor."""
+        pred = self.pact1_conf_mode == "pred"
+        for i in range(self.n_agents):
+            self._p1_beta[i] = self._p1_rls[i].beta
+            self._p1_conf[i] = (
+                self._p1_rls[i].confidence_pred(self._p1_psi[:, i]) if pred
+                else self._p1_rls[i].confidence()
+            )
+
     def _pact1_observe(self):
         """RLS update from THIS step's deflection readings.
 
@@ -1346,7 +1416,21 @@ class StarCraft2Env(MultiAgentEnv):
         actually landed, and knows the pre-shift s_hat it applied itself, so it can
         reconstruct the true displacement s and read off  ell_meas = s/(K-1).  The
         regressor is self._p1_psi, which is the psi that PRODUCED the ell applied
-        this step -- so the pair is time-aligned.  Quantisation error <= 0.5/(K-1)."""
+        this step -- so the pair is time-aligned.  Quantisation error <= 0.5/(K-1).
+
+        FROZEN while the ell being measured was produced at severity 0: y == 0 there
+        for every unit whatever psi does, which is the absence of the channel rather
+        than evidence about beta*.  See pact1_warmup_freeze in _snd_resolve_knobs for
+        the two measured harms of not freezing."""
+        frozen = bool(self.pact1_warmup_freeze) and self._p1_sigma_ell <= 0.0
+        self._p1_frozen = 1.0 if frozen else 0.0
+        if frozen:
+            # Still refresh the readouts so the obs block is well defined, but leave
+            # beta_hat and P untouched.  P stays at p0*I, so BOTH confidence forms
+            # return exactly 1/(1+r) for any psi and the whole appended block is a
+            # constant vector -- input-equivalent to blind, which is the point.
+            self._pact1_refresh_conf()
+            return
         for i in range(self.n_agents):
             k = int(self._p1_kobs[i])
             if k <= 1 or self._p1_sobs[i] < 0.0:
@@ -1356,9 +1440,8 @@ class StarCraft2Env(MultiAgentEnv):
                 continue
             self._p1_ellmeas[i] = y
             self._p1_rls[i].update(self._p1_psi[:, i], y)
-        for i in range(self.n_agents):
-            self._p1_beta[i] = self._p1_rls[i].beta
-            self._p1_conf[i] = self._p1_rls[i].confidence()
+            self._p1_n_upd += 1
+        self._pact1_refresh_conf()
 
     def _pact1_advance(self, exert, denom, alive):
         """Run the per-basis leak, rebuild psi, and return the TRUE shared load x2.
@@ -1377,6 +1460,10 @@ class StarCraft2Env(MultiAgentEnv):
         for i in range(self.n_agents):
             self._p1_ellhat[i] = max(0.0, _p1_predict_ell(self._p1_beta[i], psi[:, i]))
         self._p1_ellhat[~alive] = 0.0
+        # re-evaluate the confidence against the psi the compensator will actually
+        # use next step (no-op under conf_mode="trace"; exactly 1/(1+r) while frozen,
+        # for any psi, so the appended block stays constant through the warmup)
+        self._pact1_refresh_conf()
         return x2.astype(np.float32)
 
     def _pact1_diag(self):
@@ -1386,12 +1473,54 @@ class StarCraft2Env(MultiAgentEnv):
         beta_true = float(self._snd_payload) * self._snd_sigma_applied * self._p1_theta
         beta_hat = self._p1_beta.mean(axis=0)
         fired = self._p1_kobs > 1
+        # cond(E[psi psi^T]) -- guide III.6.  On SMAC the two channels are driven by
+        # attrition of two unit types, so this says whether the SPLIT is identifiable
+        # at all or only the projection beta*.psi is.  Report it before claiming to
+        # have identified theta.  Cheap: r=2.
+        psi_cond = float("nan")
+        psi_lmin = float("nan")
+        if self._p1_gram_n > 0:
+            # de-bias the EMA so the first few thousand steps are not scaled down
+            G = self._p1_gram / max(1e-12, 1.0 - 0.999 ** self._p1_gram_n)
+            w = np.linalg.eigvalsh(0.5 * (G + G.T))
+            lo, hi = float(w[0]), float(w[-1])
+            psi_lmin = lo
+            psi_cond = (hi / lo) if lo > 1e-12 else float("inf")
+        # the appended block exactly as _snd_augment builds it: (n_agents, 1+r+1+1)
+        aug = np.stack(
+            [self._p1_ellhat]
+            + [self._p1_beta[:, m] for m in range(_P1R)]
+            + [self._p1_conf, self._p1_ellmeas],
+            axis=1,
+        )
         return {
             "p1_ellhat": float(self._p1_ellhat.mean()),
             "p1_conf": float(self._p1_conf.mean()),
+            "p1_conf_min": float(self._p1_conf.min()),
+            "p1_conf_max": float(self._p1_conf.max()),
             "p1_beta_err": float(np.linalg.norm(beta_hat - beta_true)),
             "p1_beta_hat0": float(beta_hat[0]),
+            "p1_beta_hat1": float(beta_hat[1]) if _P1R > 1 else float("nan"),
             "p1_beta_true0": float(beta_true[0]),
+            "p1_beta_true1": float(beta_true[1]) if _P1R > 1 else float("nan"),
+            # is the estimator frozen (curriculum sigma == 0), and has it ever run?
+            "p1_frozen": float(self._p1_frozen),
+            "p1_n_upd": float(self._p1_n_upd),
+            # the regressor itself: if psi is ~0 the sensor has nothing to regress on
+            "p1_psi_norm": float(np.linalg.norm(self._p1_psi, axis=0).mean()),
+            "p1_psi_cond": psi_cond,
+            "p1_psi_lmin": psi_lmin,
+            # *** WHAT THE POLICY ACTUALLY SEES -- THE AUGMENTATION CONTROL. ***
+            # The append is the ONLY thing that differs from blind at severity 0, so
+            # measure it instead of arguing about it.  aug_var is the variance ACROSS
+            # UNITS of each appended component, averaged over components; combined
+            # with p1_conf being pinned flat over time it certifies that the block is
+            # a CONSTANT vector, which carries zero information (a LayerNorm + linear
+            # first layer absorbs a constant input exactly).  Frozen, this must read
+            # 0.0 and p1_conf must read 1/(1+r) forever.  Anything else means the arm
+            # was never input-equivalent to blind during the warmup.
+            "p1_aug_absmean": float(np.abs(aug).mean()),
+            "p1_aug_var": float(aug.var(axis=0).mean()),
             "p1_shat": float(self._p1_shat.mean()),
             "p1_obs_frac": float(fired.mean()),   # how often the sensor fires at all
             # net displacement AFTER compensation: 0 == the shot landed where aimed
@@ -1581,6 +1710,23 @@ class StarCraft2Env(MultiAgentEnv):
             "cwo_throughput": fire_frac * (1.0 - drop_frac),         # shots actually LANDED
             "cwo_fire_hi_load": fire_hi,   # BIASED -- see the docstring, do not read as
             "cwo_fire_lo_load": fire_lo,   # coordination; use cwo_hold_frac by phase
+            # --- IS THE TEAM FIGHTING OR FARMING?  (the sigma=0 basin, see below) ---
+            # ally_dead / enemy_dead are the honest read on whether a long episode is
+            # a hard-fought battle or a standoff: in the timeout basin BOTH stay low
+            # while ep_len pins at the limit and reward keeps accruing.
+            "cwo_ally_dead": 1.0 - (float(na) / float(n)) if n else 0.0,
+            "cwo_enemy_dead": (
+                float(self.death_tracker_enemy.mean())
+                if getattr(self, "death_tracker_enemy", None) is not None
+                and np.size(self.death_tracker_enemy) else 0.0
+            ),
+            # shield-regeneration pay, in the SAME units as the logged reward, so it
+            # can be read directly as a fraction of r_step_mean (see reward_battle)
+            "cwo_regen_pay": (
+                float(getattr(self, "_cwo_regen_pay", 0.0))
+                / max(1e-9, self.max_reward / self.reward_scale_rate)
+                if self.reward_scale else float(getattr(self, "_cwo_regen_pay", 0.0))
+            ),
         }
 
     def _snd_step(self, actions_int):
@@ -1673,6 +1819,25 @@ class StarCraft2Env(MultiAgentEnv):
         # drop prob: free below the KNEE, then linear in the excess, capped at _LMAX.
         excess = np.maximum(0.0, self._cwo_x2 - _KNEE) / max(1e-6, 1.0 - _KNEE)
         self._cwo_ell = np.clip(A * sigma * excess, 0.0, _LMAX).astype(np.float32)
+        if self.snd_pact1:
+            # remember what produced THIS ell: the readings it generates are consumed
+            # by _pact1_observe on the NEXT step, and the warmup freeze gates on it.
+            # *** Gate on the CURRICULUM sigma only, never on A. ***  A y == 0 reading
+            # at the driver TROUGH is real data -- beta* = A*sigma*theta genuinely is
+            # ~0 there, and the estimator has to track it down and back up.  Freezing
+            # at the trough would hold a stale high beta_hat into the rise and
+            # over-compensate.  Only sigma == 0 means "the channel does not exist".
+            self._p1_sigma_ell = float(sigma)
+            if alive.any():
+                Psi = self._p1_psi[:, alive]                    # (r, n_alive)
+                # EMA, not a lifetime sum: conditioning is a property of the CURRENT
+                # behaviour (a policy that stops fighting degenerates the regressor),
+                # and a lifetime average would hide that behind early data.
+                w = 0.999
+                self._p1_gram = w * self._p1_gram + (1.0 - w) * (
+                    (Psi @ Psi.T) / float(Psi.shape[1])
+                )
+                self._p1_gram_n += 1
         self._cwo_x2[~alive] = 0.0
         self._cwo_x3[~alive] = 0.0
         self._cwo_x3try[~alive] = 0.0
@@ -2042,6 +2207,25 @@ class StarCraft2Env(MultiAgentEnv):
             reward = abs(delta_enemy + delta_deaths)  # shield regeneration
         else:
             reward = delta_enemy + delta_deaths - delta_ally
+
+        # --- DIAGNOSTIC ONLY: how much of this reward is SHIELD-REGENERATION PAY? ---
+        # This is stock SMAC and is NOT modified here (guide I.2: the reward function
+        # is untouched byte for byte).  But it is the quantitative explanation of the
+        # "farm damage, never finish" timeout basin that has now eaten a run on BOTH
+        # arms, so it must be MEASURED rather than assumed:
+        #   delta_enemy sums (prev_health+prev_shield) - (health+shield) per enemy.
+        #   Protoss shields regenerate out of combat, so on a step where the team is
+        #   NOT dealing damage that sum goes NEGATIVE -- and abs() pays the team for
+        #   it.  A squad that stands off and lets 8 enemies regenerate collects real
+        #   positive reward for doing nothing, and collects MORE of it the longer the
+        #   episode runs.  That is a gradient straight into the 150-step timeout.
+        # cwo_regen_pay = the part of this step's reward that came from a negative
+        # raw delta, i.e. pure regeneration payment.  Read it as a fraction of
+        # r_step_mean: if it is a large share, the basin is a reward artifact and no
+        # amount of method work will climb out of it.
+        raw = float(delta_enemy + delta_deaths)
+        self._cwo_regen_pay = float(-raw) if (self.reward_only_positive and raw < 0.0) else 0.0
+        self._cwo_reward_raw = raw
 
         return reward
 
