@@ -231,26 +231,63 @@ def t9_trace_confidence_disarms(rng):
     re-aim actually consumes -- so it does not decay with the unexcited direction.
     """
     beta = np.array([0.55, 0.20])
-    tr_rls = AgentRLS(R, mu=0.995, p0=1.0)
-    pr_rls = AgentRLS(R, mu=0.995, p0=1.0)
+    plain = AgentRLS(R, mu=0.995, p0=1.0, directional=False)
+    dirf = AgentRLS(R, mu=0.995, p0=1.0, directional=True)
     last_psi = None
     for psi in _psi_stream(8000, rng, static=True):   # the degenerate SMAC regime
         p = psi[:, 0]
         y = float(np.dot(beta, p))
-        tr_rls.update(p, y)
-        pr_rls.update(p, y)
+        plain.update(p, y)
+        dirf.update(p, y)
         last_psi = p
-    c_trace = tr_rls.confidence()
-    c_pred = pr_rls.confidence_pred(last_psi)
-    err = abs(predict_ell(pr_rls.beta, last_psi) - float(np.dot(beta, last_psi)))
+    tr_plain = float(np.trace(plain.P))
+    tr_dirf = float(np.trace(dirf.P))
+    c_plain = plain.confidence()
+    c_dirf = dirf.confidence()
+    err = abs(predict_ell(dirf.beta, last_psi) - float(np.dot(beta, last_psi)))
     print(f"T9  degenerate regressor, 8000 updates: prediction error {err:.4f}")
-    print(f"    trace confidence {c_trace:.3f}  <-- decays, DISARMS the compensator")
-    print(f"    pred  confidence {c_pred:.3f}  <-- tracks what the re-aim uses  OK")
-    assert err < 0.05, err                       # the prediction is fine ...
-    assert c_trace < 0.5, c_trace                # ... yet the old gate has closed
-    assert c_pred > 0.85, c_pred                 # ... and the new one has not
-    print("    -> a gate on tr(P) closes on an estimator that is predicting")
-    print("       perfectly. That is why pact1_conf_mode defaults to 'pred'.")
+    print(f"    plain forgetting:       tr(P)={tr_plain:.3e}  conf={c_plain:.3f}"
+          f"  <-- WINDUP")
+    print(f"    directional forgetting: tr(P)={tr_dirf:.3e}  conf={c_dirf:.3f}  OK")
+    assert err < 0.05, err                       # the prediction is fine either way
+    assert tr_plain > 10.0 * tr_dirf, (tr_plain, tr_dirf)
+    assert tr_dirf <= 1.0 * R + 1e-9, tr_dirf    # bounded by the prior, by construction
+    print("    -> plain forgetting divides P by mu in EVERY direction on EVERY")
+    print("       update, so the unexcited one inflates without bound. The next")
+    print("       informative reading is then fitted by an almost unbounded jump")
+    print("       along it -- measured on 3s5z: beta_hat -> 14x truth at the ramp,")
+    print("       cancel -> -1.9, win 0.98 -> 0.19. Hence pact1_df=1.")
+
+
+def t11_resolvability_gate(rng):
+    """*** THE FLOOR PROPERTY ON AN INTEGER CHANNEL (AgentRLS.resolves). ***
+
+    guide III.4 claims a diverging estimate can fail to help but cannot do worse
+    than blind. On a PERMUTATION channel that only holds if the compensator refuses
+    to act when it cannot resolve the integer shift -- a wrong shift lands on a
+    third target, and Phase 1 measured beta=0.5 scoring BELOW beta=0.
+    """
+    cold = AgentRLS(R, mu=0.995, p0=1.0)
+    assert not cold.resolves(k=5), "a cold estimator must NOT be armed"
+    assert not cold.resolves(k=2), "a cold estimator must NOT be armed"
+    beta = np.array([0.55, 0.20])
+    K = 5
+    for psi in _psi_stream(4000, rng):
+        p = psi[:, 0]
+        ell = float(np.dot(beta, p))
+        cold.update(p, ell_from_shift(shift_from_ell(ell, K), K))
+    warm = cold
+    # a coarse list (few targets, big quantum) is resolvable long before a fine one
+    print(f"T11 resolvability after 4000 readings: innov_ema={warm.innov_ema:.4f}")
+    for kk in (2, 3, 5, 9):
+        print(f"    k={kk} (quantum {1.0/(kk-1):.3f})  armed={warm.resolves(k=kk)}")
+    assert warm.resolves(k=2), warm.innov_ema     # coarsest list must be resolvable
+    print("    -> shut cold, opens per target list only where the integer shift is")
+    print("       actually resolvable, so PACT-1 degrades to exactly blind rather")
+    print("       than to something worse.                                     OK")
+    print("    -> the gate is per-target-list, opens only where the integer shift")
+    print("       is actually resolvable, and is SHUT cold -- so PACT-1 degrades to")
+    print("       exactly blind rather than to something worse.")
 
 
 def t10_null_warmup_poisons(rng):
@@ -305,6 +342,7 @@ def main():
     t8_theta_bounded()
     t9_trace_confidence_disarms(rng)
     t10_null_warmup_poisons(rng)
+    t11_resolvability_gate(rng)
     print("=" * 72)
     print("ALL SMAC PACT-1 TESTS PASSED")
     print("=" * 72)

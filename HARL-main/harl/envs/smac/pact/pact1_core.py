@@ -126,31 +126,132 @@ class AgentRLS:
     intermittent deflection readings. Decentralized: unit i never sees another
     unit's residual, only the shared engagement that builds psi."""
 
-    def __init__(self, r=R, mu=0.995, p0=1.0):
+    def __init__(self, r=R, mu=0.995, p0=1.0, directional=True, innov_lam=0.99):
         self.r = int(r)
         self.mu = float(mu)
         self.p0 = float(p0)
+        self.directional = bool(directional)
+        self.innov_lam = float(innov_lam)
         self.P = np.eye(self.r) * self.p0
         self.beta = np.zeros(self.r)
         self.n_upd = 0
         self.innov = 0.0
+        # EMA of |prediction error|, in the SAME units as ell.  Initialised
+        # PESSIMISTICALLY at 1 ("I cannot resolve anything"), so a compensator gated
+        # on it stays disarmed until the estimator has earned the right to act.
+        self.innov_ema = 1.0
 
-    def update(self, psi, y):
-        """One scalar observation: y ~= beta . psi."""
+    def update(self, psi, y, var=1.0):
+        """One scalar observation: y ~= beta . psi, with measurement variance ``var``
+        RELATIVE to a reference reading (1.0 = the reference).
+
+        *** WHY var EXISTS -- IT IS THE ANT ANALOGUE THAT WAS MISSING. ***
+        Ant's sensor is continuous and its noise is DECLARED (ANT_PCR_SENSOR_NOISE =
+        0.01, a real torque-sensor spec) and constant, so an unweighted RLS is
+        correct there.  SMAC's sensor is a rounded integer: observing shift s on a
+        list of K attackable enemies says ell lies within +/- 0.5/(K-1), so the
+        measurement variance is (1/(K-1))^2/12 and it varies by 64x between a
+        2-target and a 9-target list.  Feeding both to RLS with equal weight throws
+        that away -- and it is the coarse, nearly-uninformative readings that
+        dominate when ell is small, which is exactly the curriculum ramp.
+
+        Weighting by precision is textbook and it is what makes the ramp survivable:
+        a `y = 0` from a K=2 unit means only "ell < 0.5" (worthless), while the same
+        reading from a K=9 unit means "ell < 0.0625" (very informative).  See
+        StarCraft2_Env._pact1_observe for where var is computed.
+
+        *** COVARIANCE WINDUP IS THE FAILURE MODE THAT MATTERS HERE. ***
+        Plain forgetting divides P by mu in EVERY direction on EVERY update, so a
+        direction the regressor never excites inflates as mu^-n without bound.  On
+        SMAC the regressor is near-degenerate by construction (Phi=alive makes
+        B_same and B_cross both track squad size; measured cond(E[psi psi^T]) ~ 10),
+        so after a few thousand updates P has a ~1e19 eigenvalue in the near-null
+        direction.  The next informative reading is then fitted by an almost
+        unbounded jump along that eigenvector, and beta_hat leaves the reservation
+        even though every residual it was fitted to was ~0.
+
+        Measured on 3s5z at the curriculum ramp: over ~8.9k updates beta_hat went
+        0 -> 14x the true beta*, ell_hat -> 9x the true ell, and the compensator
+        re-aimed shots by 1-3 places when the true deflection was 0 -- net_shift
+        0.70 against raw_shift 0.07, i.e. TEN TIMES the harm the channel was doing.
+        A 0.98 win rate collapsed to 0.19 in 50 rollouts and never came back.
+
+        DIRECTIONAL FORGETTING (Kulhavy) fixes it at the source: the information
+        matrix is discounted ONLY in the subspace the data actually excited, so
+        unexcited directions keep their prior certainty forever.  A hard trace bound
+        backs it up -- the estimator is never allowed to become LESS certain than
+        its own prior, which makes windup impossible by construction whatever the
+        excitation does."""
         psi = np.asarray(psi, dtype=np.float64).reshape(-1)
+        var = max(1e-9, float(var))
         Pp = self.P @ psi
-        den = self.mu + float(psi @ Pp)
-        if den < 1e-12:
-            return self.beta
-        K = Pp / den
+        s = float(psi @ Pp)
         e = float(y) - float(psi @ self.beta)
-        self.beta = self.beta + K * e
-        self.P = (self.P - np.outer(K, Pp)) / self.mu
+        if self.directional:
+            # 1. information update, NO forgetting (P^-1 <- P^-1 + psi psi^T / var)
+            den = var + s
+            if den < 1e-12:
+                return self.beta
+            K = Pp / den
+            self.beta = self.beta + K * e
+            self.P = self.P - np.outer(Pp, Pp) / den
+            # 2. forgetting applied ONLY along the excited direction
+            if s > 1e-12:
+                Pp2 = self.P @ psi
+                s2 = float(psi @ Pp2)
+                if s2 > 1e-12:
+                    self.P = self.P + ((1.0 - self.mu) / self.mu) * (
+                        np.outer(Pp2, Pp2) / s2
+                    )
+        else:
+            den = self.mu * var + s
+            if den < 1e-12:
+                return self.beta
+            K = Pp / den
+            self.beta = self.beta + K * e
+            self.P = (self.P - np.outer(K, Pp)) / self.mu
         self.P = 0.5 * (self.P + self.P.T)
+        if self.directional:
+            # hard windup bound: never less certain than the prior.  Belt and braces
+            # -- with directional forgetting this should not bind, and if it does the
+            # estimator stays bounded anyway.  Deliberately NOT applied when
+            # directional is off, so `directional=False` reproduces the original
+            # estimator exactly and is a clean ablation.
+            tr = float(np.trace(self.P))
+            tr_max = self.p0 * self.r
+            if tr > tr_max:
+                self.P *= tr_max / tr
         self.beta = np.clip(self.beta, 0.0, 10.0)   # beta* = c*theta >= 0 by construction
         self.innov = abs(e)
+        lam = self.innov_lam
+        self.innov_ema = lam * self.innov_ema + (1.0 - lam) * abs(e)
         self.n_upd += 1
         return self.beta
+
+    def resolves(self, k, quantum_frac=0.5):
+        """*** THE ARMING GATE FOR AN INTEGER (PERMUTATION) CHANNEL. ***
+
+        The compensator does not need `ell_hat` to be close to `ell`; it needs
+        ``round(ell_hat*(k-1)) == round(ell*(k-1))``.  One quantum on a list of k
+        attackable enemies is ``1/(k-1)``, so the estimator may only act when its
+        own REALIZED prediction error is small compared with that quantum:
+
+            innov_ema * (k-1)  <=  quantum_frac
+
+        This is measurable, decentralized and unprivileged -- it is the unit's own
+        running residual against its own shot readings, nothing else.  It replaces a
+        covariance proxy that cannot express the question: on the 3s5z run
+        `conf` read 0.92 while the estimator was predicting 9x the truth.
+
+        It also restores the METHOD'S FLOOR PROPERTY (guide III.4): with the gate
+        shut the executed action is exactly the policy's own, i.e. plain HAPPO, so a
+        diverging estimate can fail to help but can no longer do worse than blind.
+        On a permutation channel that guarantee is the whole safety argument --
+        partial re-aim lands the shot on a DIFFERENT wrong target and Phase 1
+        measured beta=0.5 scoring BELOW beta=0."""
+        if k <= 1:
+            return False
+        return self.innov_ema * float(k - 1) <= float(quantum_frac)
 
     def confidence(self):
         """Self-reported trust in [0,1] from the covariance: 1/(1+r) when cold,

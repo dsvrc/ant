@@ -143,6 +143,19 @@ _COLS = [
     "p1_frozen", "p1_n_upd", "p1_aug_var", "p1_aug_absmean",
     "p1_beta_hat0", "p1_beta_hat1", "p1_beta_true0", "p1_beta_true1",
     "p1_psi_norm", "p1_psi_cond", "p1_psi_lmin", "p1_conf_min", "p1_conf_max",
+    # --- READ THESE FIRST WHEN THE ARM UNDERPERFORMS BLIND --------------------
+    # p1_ell_ratio  ell_hat / ell_true.  THE headline health number.  ~1 is right;
+    #               it hit 9.0 at the curriculum ramp while p1_conf still read 0.92,
+    #               and p1_cancel went to -1.9 (the compensator adding twice the
+    #               deflection the channel applied).
+    # p1_trP        tr(P) -- the covariance windup detector.  Now hard-bounded at
+    #               p0*r; pinned at the bound == degenerate regressor.
+    # p1_innov      realized |prediction error| EMA, in units of ell.  Must fall
+    #               below one quantum 1/(k-1) for the compensator to arm.
+    # p1_armed      fraction of units whose resolvability gate is open.  0 means
+    #               PACT-1 is deliberately running as blind -- which is the CORRECT
+    #               behaviour when the estimate cannot resolve the integer shift.
+    "p1_ell_ratio", "p1_trP", "p1_innov", "p1_armed",
 ]
 
 
@@ -218,7 +231,8 @@ class OnPolicyPactSmacRunner(OnPolicyHARunner):
                 "p1_frozen", "p1_n_upd", "p1_aug_var", "p1_aug_absmean",
                 "p1_bh0", "p1_bh1", "p1_bt0", "p1_bt1",
                 "p1_psi_norm", "p1_psi_cond", "p1_psi_lmin",
-                "p1_conf_min", "p1_conf_max"]
+                "p1_conf_min", "p1_conf_max",
+                "p1_ell_ratio", "p1_trP", "p1_innov", "p1_armed"]
         acc = {k: [] for k in keys}
         for ph in ("peak", "trough"):
             for k in ("ell", "drop", "fire", "hold", "thru", "fire_hi", "fire_lo"):
@@ -294,6 +308,10 @@ class OnPolicyPactSmacRunner(OnPolicyHARunner):
             a["p1_psi_lmin"].append(float(d.get("p1_psi_lmin", np.nan)))
             a["p1_conf_min"].append(float(d.get("p1_conf_min", np.nan)))
             a["p1_conf_max"].append(float(d.get("p1_conf_max", np.nan)))
+            a["p1_ell_ratio"].append(float(d.get("p1_ell_ratio", np.nan)))
+            a["p1_trP"].append(float(d.get("p1_trP", np.nan)))
+            a["p1_innov"].append(float(d.get("p1_innov", np.nan)))
+            a["p1_armed"].append(float(d.get("p1_armed", np.nan)))
             # leak gate (smacv2/CWD): only counts where there is real waveform signal
             cos = float(d.get("pact_cos", np.nan))
             x2l = float(d.get("pact_x2load", np.nan))
@@ -382,6 +400,7 @@ class OnPolicyPactSmacRunner(OnPolicyHARunner):
             m(a["p1_bh0"]), m(a["p1_bh1"]), m(a["p1_bt0"]), m(a["p1_bt1"]),
             m(a["p1_psi_norm"]), m(a["p1_psi_cond"]), m(a["p1_psi_lmin"]),
             m(a["p1_conf_min"]), m(a["p1_conf_max"]),
+            m(a["p1_ell_ratio"]), m(a["p1_trP"]), m(a["p1_innov"]), m(a["p1_armed"]),
         ]
         if self._dbg_w is not None:
             self._dbg_w.writerow([round(v, 5) if isinstance(v, float) else v for v in row])
@@ -392,6 +411,9 @@ class OnPolicyPactSmacRunner(OnPolicyHARunner):
                                   self._m(self._ep_lens) if self._ep_lens else float("nan"),
                                   sigma, win_rate, timeout_frac)
         self._check_aug_inert(step, sigma, m(a["p1_aug_var"]), m(a["p1_frozen"]))
+        self._check_compensator_harm(step, m(a["p1_cancel"]), m(a["p1_ell_ratio"]),
+                                     m(a["p1_raw"]), m(a["p1_net"]), m(a["p1_innov"]),
+                                     m(a["p1_armed"]))
 
         if self._roll % 10 == 1:
             print(f"[PACT dbg] roll={self._roll} step={step} sigma={sigma:.2f} | "
@@ -411,6 +433,43 @@ class OnPolicyPactSmacRunner(OnPolicyHARunner):
         self._acc = self._fresh()
         self._ep_lens = []
         self._ep_rets = []
+
+    def _check_compensator_harm(self, step, cancel, ell_ratio, raw, net, innov, armed):
+        """*** THE ALARM THAT SHOULD HAVE FIRED AT 6M INSTEAD OF 20M. ***
+
+        PACT-1's advertised floor property (guide III.4) is that the estimator sits
+        outside the worst-case control path: with the compensator off the executed
+        action is the policy's own, so a diverging estimate can fail to help but
+        cannot do worse than blind.  `p1_cancel < 0` means that property is BROKEN --
+        the re-aim is adding more displacement than the channel applied, which on a
+        permutation channel means the shot lands on a third, entirely wrong target.
+
+        Measured on the 20M 3s5z run: at the curriculum ramp cancel went to -1.9
+        with net_shift 0.70 against raw_shift 0.07 -- ten times the harm the NS was
+        doing -- and a 0.98 win rate collapsed to 0.19 in 50 rollouts.  Nothing in
+        the logs said so at the time; `p1_conf` read 0.92 throughout.
+
+        Warns rather than aborts: a couple of negative rollouts while the estimator
+        is cold is expected.  Sustained negative cancellation is not."""
+        if not np.isfinite(cancel):
+            return
+        self._harm = getattr(self, "_harm", 0)
+        self._harm = self._harm + 1 if cancel < -0.10 else 0
+        if self._harm == 10 and not getattr(self, "_harm_warned", False):
+            self._harm_warned = True
+            print(f"[PACT][COMPENSATOR HARMING] at step {step}: p1_cancel="
+                  f"{cancel:+.2f} for 10 consecutive rollouts -- the re-aim is adding "
+                  f"deflection, not removing it (raw={raw:.3f} -> net={net:.3f}).\n"
+                  f"    ell_hat/ell_true = {ell_ratio:.1f}x, realized |error| = "
+                  f"{innov:.3f}, arming gate open on {armed:.0%} of units.\n"
+                  f"    On a PERMUTATION channel a wrong integer shift lands the shot "
+                  f"on a third target, so this is strictly worse than blind and the "
+                  f"method's floor property is violated.\n"
+                  f"    If ell_hat/ell_true >> 1: covariance windup -- check p1_trP "
+                  f"and confirm env_args.pact1_df=1 (directional forgetting).\n"
+                  f"    If the ratio is ~1 but cancel is still low: the estimate is "
+                  f"good but cannot resolve the INTEGER shift -- raise "
+                  f"env_args.pact1_resolve strictness (lower the number).", flush=True)
 
     def _check_aug_inert(self, step, sigma, aug_var, frozen):
         """*** THE CONTROL THAT SETTLES THE OBS-AUGMENTATION QUESTION. ***

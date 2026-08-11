@@ -381,6 +381,10 @@ _PACT1_RADIUS = float(os.environ.get("SMAC_SND_MIX_RADIUS", "0.35"))
 #                 unbounded theta is a different task at a different effective
 #                 severity -- outside the certified frontier, where nothing recovers.
 _PACT1_CONC = float(os.environ.get("SMAC_SND_MIX_CONC", "0.9"))
+_P1KREF = float(os.environ.get("SMAC_SND_KREF", "5"))
+#                 reference target-list size at which a deflection reading counts as
+#                 variance 1.  Only ratios matter (see _pact1_observe); 5 is the
+#                 typical number of attackable enemies on 3s5z.
 _PACT1_LOOP = float(os.environ.get("SMAC_SND_LOOP", "0"))
 #                 >0 closes the compensation loop: Phi_j <- Phi_j*(1 + LOOP*|s_hat_j|)
 #                 so a unit that corrects harder loads the bus harder.  0 = the
@@ -1196,8 +1200,16 @@ class StarCraft2Env(MultiAgentEnv):
         #                                            (use the full severity to measure harm)
         # --- PACT-1: unknown interference split, estimated online -----------------
         self.snd_pact1 = int(a.get("snd_pact1", 0))
-        self.pact1_forget = float(a.get("pact1_forget", 0.995))   # RLS forgetting
-        self.pact1_p0 = float(a.get("pact1_p0", 1.0))             # RLS prior looseness
+        # RLS forgetting and prior looseness.  *** DEFAULTS NOW MATCH ANT'S, WHICH
+        # ARE THE ONES THAT CONVERGED (beta_err 0.072 -> 0.020, cos 0.99). ***
+        # SMAC previously ran mu=0.995 / p0=1 against Ant's mu=0.999 / p0=10, i.e.
+        # it forgot FIVE TIMES FASTER on a regressor that is SIX TIMES worse
+        # conditioned (cond(E[psi psi^T]) ~ 10 here against 1.63 on Ant) and that
+        # only produces a reading when the unit fires -- roughly half the steps,
+        # against Ant's every step.  That is backwards on all three counts: less
+        # information per unit time demands MORE averaging, not less.
+        self.pact1_forget = float(a.get("pact1_forget", 0.999))   # RLS forgetting
+        self.pact1_p0 = float(a.get("pact1_p0", 10.0))            # RLS prior looseness
         self.pact1_assist = int(a.get("pact1_assist", 1))
         #   1 = the env applies the pre-shift (a real compensator, Ant's structure);
         #   0 = obs-only, the policy must learn the re-aim itself from ell_hat.
@@ -1247,6 +1259,17 @@ class StarCraft2Env(MultiAgentEnv):
         assert self.pact1_conf_mode in ("pred", "trace"), (
             f"pact1_conf_mode must be 'pred' or 'trace' (got {self.pact1_conf_mode!r})"
         )
+        # *** DIRECTIONAL FORGETTING.  DEFAULT ON.  See AgentRLS.update. ***  0 = the
+        # original scalar forgetting, which winds the covariance up without bound on
+        # a near-degenerate regressor and is what blew beta_hat to 14x truth at the
+        # curriculum ramp on 3s5z.
+        self.pact1_df = int(a.get("pact1_df", 1))
+        # *** THE RESOLVABILITY GATE.  See AgentRLS.resolves. ***  Re-aim only when
+        # the unit's own realized prediction error is below this fraction of one
+        # quantum (1/(k-1)) on its current target list.  0.5 = "my typical error is
+        # under half a place".  Set <=0 to disable (restores the old covariance-only
+        # gate and with it the ability to do worse than blind).
+        self.pact1_resolve = float(a.get("pact1_resolve", 0.5))
         self.pact1_ctde = int(a.get("pact1_ctde", 0))             # true A -> critic only
         # de-phasing: this env's starting point on the driver cycle, in [0,1).  Set by
         # make_train_env / make_eval_env from the worker rank so the ensemble tiles the
@@ -1280,6 +1303,9 @@ class StarCraft2Env(MultiAgentEnv):
             ) + (" +CTDE" if self.pact1_ctde else "") + (
                 ", RLS FROZEN at sigma=0" if self.pact1_warmup_freeze
                 else ", RLS RUNS at sigma=0 (WARMUP CONFOUND -- see pact1_warmup_freeze)"
+            ) + (
+                f"; mu={self.pact1_forget} p0={self.pact1_p0} "
+                f"df={self.pact1_df} resolve={self.pact1_resolve} kref={_P1KREF:g}"
             )
         elif self.snd_pact:
             mode = "PACT (computed x2%s in obs+state)" % (
@@ -1349,7 +1375,9 @@ class StarCraft2Env(MultiAgentEnv):
         self._p1_psi = np.zeros((_P1R, n))      # regressor ALIGNED with the applied ell
         self._p1_types = np.full(n, -1, dtype=np.int64)
         self._p1_rls = [
-            _P1RLS(_P1R, self.pact1_forget, self.pact1_p0) for _ in range(n)
+            _P1RLS(_P1R, self.pact1_forget, self.pact1_p0,
+                   directional=bool(self.pact1_df))
+            for _ in range(n)
         ]
         self._p1_beta = np.zeros((n, _P1R))     # beta_hat per agent
         # cold-prior confidence, so the value in the obs is meaningful from step 1
@@ -1439,7 +1467,15 @@ class StarCraft2Env(MultiAgentEnv):
             if y is None:
                 continue
             self._p1_ellmeas[i] = y
-            self._p1_rls[i].update(self._p1_psi[:, i], y)
+            # Measurement variance of THIS reading, relative to a reference target
+            # list of _P1KREF enemies.  Rounding to the nearest of (k-1) places is a
+            # uniform quantiser of step 1/(k-1), so var ~ (1/(k-1))^2/12; only the
+            # RATIO matters to RLS, so it is normalised at k = _P1KREF (var = 1).
+            # A 2-target reading is then 16x less trusted than a 5-target one and
+            # 64x less than a 9-target one -- which is the truth, and ignoring it is
+            # what let the coarse near-zero readings of the early ramp dominate.
+            var = ((_P1KREF - 1.0) / float(k - 1)) ** 2
+            self._p1_rls[i].update(self._p1_psi[:, i], y, var)
             self._p1_n_upd += 1
         self._pact1_refresh_conf()
 
@@ -1506,6 +1542,32 @@ class StarCraft2Env(MultiAgentEnv):
             # is the estimator frozen (curriculum sigma == 0), and has it ever run?
             "p1_frozen": float(self._p1_frozen),
             "p1_n_upd": float(self._p1_n_upd),
+            # *** THE THREE COLUMNS THAT WOULD HAVE CAUGHT THE RAMP BLOW-UP. ***
+            # p1_trP    tr(P): THE WINDUP DETECTOR.  Bounded by p0*r by construction
+            #           now; if it ever pins at that bound the regressor has gone
+            #           degenerate and the estimate is being held up by the cap.
+            # p1_innov  the estimator's own realized |prediction error|, in units of
+            #           ell.  This is what the arming gate reads.  It must fall below
+            #           one quantum 1/(k-1) (~0.12-0.5 on 3s5z) or the compensator
+            #           correctly refuses to act.
+            # p1_ell_ratio  ell_hat / ell_true: the single number that screams.  It
+            #           hit 9.0 at the ramp while p1_conf still read 0.92.  Healthy
+            #           is ~1; > 2 means the compensator is inventing deflection.
+            "p1_trP": float(np.mean([np.trace(r.P) for r in self._p1_rls])),
+            "p1_innov": float(np.mean([r.innov_ema for r in self._p1_rls])),
+            "p1_ell_ratio": (
+                float(self._p1_ellhat.mean() / self._cwo_ell.mean())
+                if float(self._cwo_ell.mean()) > 1e-6 else float("nan")
+            ),
+            # over the units that actually took a shot -- k is what sets the quantum,
+            # so a unit with no target list has no gate to be open or shut
+            "p1_armed": (float(np.mean([
+                1.0 if (self.pact1_resolve <= 0.0
+                        or self._p1_rls[i].resolves(int(self._p1_kobs[i]),
+                                                    self.pact1_resolve))
+                else 0.0
+                for i in np.where(fired)[0]
+            ])) if fired.any() else float("nan")),
             # the regressor itself: if psi is ~0 the sensor has nothing to regress on
             "p1_psi_norm": float(np.linalg.norm(self._p1_psi, axis=0).mean()),
             "p1_psi_cond": psi_cond,
@@ -1908,11 +1970,26 @@ class StarCraft2Env(MultiAgentEnv):
         # partial cancellation IS partially useful) would spend the whole warmup in
         # exactly that harmful regime.  So: compensate FULLY once the estimator is
         # confident enough, and not at all before.
+        #
+        # *** AND IT IS GATED ON RESOLVABILITY, NOT ONLY ON CONFIDENCE. ***  The
+        # covariance says how uncertain the parameter is; it cannot say whether the
+        # INTEGER shift will come out right, which is the only thing that matters on
+        # a permutation channel.  On the 3s5z run `conf` read 0.92 while the
+        # estimator was predicting 9x the true deflection, and the compensator
+        # re-aimed by 1-3 places when the true shift was 0 -- net_shift 0.70 against
+        # raw_shift 0.07.  AgentRLS.resolves() gates on the unit's own realized
+        # residual against one quantum of its current target list, which is the
+        # question actually being asked, and it restores the floor property: gate
+        # shut => the executed action is the policy's own => never worse than blind.
         s_hat = 0
         if (
             self.snd_pact1 and self.pact1_assist
             and action >= self.n_actions_no_attack and k > 1
             and float(self._p1_conf[a_id]) >= self.pact1_conf_thresh
+            and (
+                self.pact1_resolve <= 0.0
+                or self._p1_rls[a_id].resolves(k, self.pact1_resolve)
+            )
         ):
             s_hat = _p1_shift_from_ell(
                 self.pact1_gpol * float(self._p1_ellhat[a_id]), k
