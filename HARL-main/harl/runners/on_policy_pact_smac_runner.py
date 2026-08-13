@@ -414,6 +414,8 @@ class OnPolicyPactSmacRunner(OnPolicyHARunner):
         self._check_compensator_harm(step, m(a["p1_cancel"]), m(a["p1_ell_ratio"]),
                                      m(a["p1_raw"]), m(a["p1_net"]), m(a["p1_innov"]),
                                      m(a["p1_armed"]))
+        self._check_tracking(step, sigma, m(a["p1_bh0"]), m(a["p1_bt0"]),
+                             m(a["p1_beta_err"]), m(a["p1_innov"]), m(a["p1_armed"]))
 
         if self._roll % 10 == 1:
             print(f"[PACT dbg] roll={self._roll} step={step} sigma={sigma:.2f} | "
@@ -433,6 +435,51 @@ class OnPolicyPactSmacRunner(OnPolicyHARunner):
         self._acc = self._fresh()
         self._ep_lens = []
         self._ep_rets = []
+
+    def _check_tracking(self, step, sigma, bh0, bt0, beta_err, innov, armed):
+        """*** THE ESTIMATOR CONVERGED TO THE CYCLE MEAN AND IS TRACKING NOTHING. ***
+
+        The signature is specific and easy to miss, because the headline number looks
+        excellent: the ROLLOUT MEAN of beta_hat matches the rollout mean of beta*
+        almost exactly, while the PER-STEP error is the full amplitude of beta*'s
+        swing.  A column-average reader sees "beta_hat 0.374 vs beta_true 0.370" and
+        concludes the estimator works.
+
+        Measured on the 20M 3s5z run at mu=0.999: bh0 0.3744 / bt0 0.3699 (1.2%) with
+        beta_err 0.362 -- i.e. sigma*theta*std(A)*sqrt(2), the exact RMS swing.  The
+        estimator's memory was 47% of the driver period, so it averaged the waveform.
+        Consequence: innov ~ ell itself, the resolvability gate open on 18% of shots,
+        cancel 0.054.
+
+        The fix is structural, not a tuning nudge: the memory must be a small fixed
+        fraction of the driver period (StarCraft2_Env._P1_MU_AUTO derives mu from
+        SMAC_SND_PERIOD so the two cannot be set inconsistently)."""
+        if sigma <= 1e-6 or not (np.isfinite(bt0) and np.isfinite(beta_err)):
+            return
+        if abs(bt0) < 1e-3:
+            return
+        mean_ok = abs(bh0 - bt0) < 0.15 * abs(bt0)      # the average is right ...
+        tracking_bad = beta_err > 0.5 * abs(bt0)        # ... the instant value is not
+        self._mistrack = getattr(self, "_mistrack", 0)
+        self._mistrack = self._mistrack + 1 if (mean_ok and tracking_bad) else 0
+        if self._mistrack == 20 and not getattr(self, "_mistrack_warned", False):
+            self._mistrack_warned = True
+            print(f"[PACT][NOT TRACKING] at step {step}: beta_hat's ROLLOUT MEAN is "
+                  f"right ({bh0:.4f} vs {bt0:.4f}) but the PER-STEP error is "
+                  f"{beta_err:.3f} -- the estimator has converged to the cycle "
+                  f"average of beta* and is tracking the driver not at all.\n"
+                  f"    Downstream: innov={innov:.3f} (comparable to ell itself), so "
+                  f"the resolvability gate is open on only {armed:.0%} of shots and "
+                  f"the compensator is effectively off.\n"
+                  f"    Cause: the estimator's memory is too long RELATIVE TO THE "
+                  f"DRIVER PERIOD.  mu is derived from SMAC_SND_PERIOD and the "
+                  f"sensor reading rate (StarCraft2_Env._P1_MU_AUTO); if this fires, "
+                  f"either pact1_forget was overridden in env_args or the measured "
+                  f"reading rate has drifted far from SMAC_SND_READRATE (compare "
+                  f"p1_obs_frac).\n"
+                  f"    Lengthening SMAC_SND_PERIOD is the other lever: it gives the "
+                  f"estimator more readings per cycle, which is the ONLY reason Ant "
+                  f"tracks and SMAC does not (Ant sees ~19x more).", flush=True)
 
     def _check_compensator_harm(self, step, cancel, ell_ratio, raw, net, innov, armed):
         """*** THE ALARM THAT SHOULD HAVE FIRED AT 6M INSTEAD OF 20M. ***

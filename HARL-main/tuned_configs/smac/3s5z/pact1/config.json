@@ -59,7 +59,6 @@
         "map_name": "3s5z",
         "state_type": "EP",
         "snd_pact1": 1,
-        "pact1_forget": 0.999,
         "pact1_p0": 10.0,
         "pact1_assist": 1,
         "pact1_gpol": 1.0,

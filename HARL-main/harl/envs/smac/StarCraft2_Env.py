@@ -273,7 +273,8 @@ _LMAX   = float(os.environ.get("SMAC_SND_LMAX", "1.0"))
 #                  cap point rewards firing MORE -- a low cap silently deletes the
 #                  coordination solution (see the HISTORY note on SEVERITY).  The
 #                  cap now only exists so the drop probability is never exactly 1.
-_PERIOD = 5000   # engagement-tempo cycle length in steps (collapse-and-recover once
+_PERIOD = int(float(os.environ.get("SMAC_SND_PERIOD", "5000")))
+#                  engagement-tempo cycle length in steps (collapse-and-recover once
 #                  per cycle).  The clock persists across episodes.  Parallel envs are
 #                  DE-PHASED across the cycle (see _snd_phase / snd_phase) so every
 #                  rollout batch and every eval round is a true cycle-average rather
@@ -381,6 +382,40 @@ _PACT1_RADIUS = float(os.environ.get("SMAC_SND_MIX_RADIUS", "0.35"))
 #                 unbounded theta is a different task at a different effective
 #                 severity -- outside the certified frontier, where nothing recovers.
 _PACT1_CONC = float(os.environ.get("SMAC_SND_MIX_CONC", "0.9"))
+# ###########################################################################
+# ###  RLS FORGETTING -- DERIVED FROM THE DRIVER PERIOD, NOT HAND-SET.     ##
+# ###########################################################################
+# The estimator must track beta* = A(t)*sigma*theta(t).  What decides whether it
+# CAN is not the forgetting factor itself but the estimator's MEMORY AS A FRACTION
+# OF THE DRIVER PERIOD -- and that depends on how often the sensor fires, which is
+# where SMAC and Ant differ by an order of magnitude:
+#
+#   Ant   1 reading/step,    mu=0.999 -> 1000 updates = 1000 steps of a 40000 period
+#                                                     =  2.5%   -> tracks (beta_err 0.020)
+#   SMAC  ~0.43 readings/step, mu=0.999 -> 1000 updates = 2330 steps of a 5000 period
+#                                                     =   47%   -> AVERAGES THE CYCLE
+#
+# Measured on the 20M 3s5z run at mu=0.999: beta_hat0 = 0.3744 against a true mean of
+# 0.3699 (the MEAN is right to 1.2%) while beta_err = 0.362 -- exactly the RMS swing
+# of beta* about its mean.  The estimator had converged to the cycle average and was
+# tracking nothing.  Downstream: innov 0.355 ~ ell itself, the resolvability gate open
+# on 18% of shots, cancel 0.054.  PACT-1 was blind with a handicap.
+#
+# So mu is DERIVED to hold the memory at Ant's ratio.  Change SMAC_SND_PERIOD and mu
+# follows; there is no way to set the two inconsistently.  env_args.pact1_forget still
+# overrides for ablations.
+_P1_MEM_FRAC = float(os.environ.get("SMAC_SND_MEMFRAC", "0.025"))
+#                 estimator memory as a fraction of the driver period.  Ant's measured
+#                 working value.  Smaller = tracks faster but amplifies the quantiser
+#                 noise; the optimum of that trade is guide III.9's tracking floor.
+_P1_READ_RATE = float(os.environ.get("SMAC_SND_READRATE", "0.43"))
+#                 sensor readings per step per unit -- MEASURED (p1_obs_frac on the
+#                 3s5z runs, 0.43-0.57).  Declared, not tuned; it only converts the
+#                 memory from steps into RLS updates.
+_P1_MU_AUTO = float(np.clip(
+    1.0 - 1.0 / max(2.0, _P1_MEM_FRAC * _PERIOD * _P1_READ_RATE), 0.90, 0.9995
+))
+
 _P1KREF = float(os.environ.get("SMAC_SND_KREF", "5"))
 #                 reference target-list size at which a deflection reading counts as
 #                 variance 1.  Only ratios matter (see _pact1_observe); 5 is the
@@ -1200,15 +1235,12 @@ class StarCraft2Env(MultiAgentEnv):
         #                                            (use the full severity to measure harm)
         # --- PACT-1: unknown interference split, estimated online -----------------
         self.snd_pact1 = int(a.get("snd_pact1", 0))
-        # RLS forgetting and prior looseness.  *** DEFAULTS NOW MATCH ANT'S, WHICH
-        # ARE THE ONES THAT CONVERGED (beta_err 0.072 -> 0.020, cos 0.99). ***
-        # SMAC previously ran mu=0.995 / p0=1 against Ant's mu=0.999 / p0=10, i.e.
-        # it forgot FIVE TIMES FASTER on a regressor that is SIX TIMES worse
-        # conditioned (cond(E[psi psi^T]) ~ 10 here against 1.63 on Ant) and that
-        # only produces a reading when the unit fires -- roughly half the steps,
-        # against Ant's every step.  That is backwards on all three counts: less
-        # information per unit time demands MORE averaging, not less.
-        self.pact1_forget = float(a.get("pact1_forget", 0.999))   # RLS forgetting
+        # RLS forgetting: DERIVED from the driver period and the sensor's reading
+        # rate so the estimator's memory is a fixed small fraction of the cycle it
+        # has to track -- see _P1_MU_AUTO.  Copying Ant's mu directly is what made
+        # the estimator converge to the cycle MEAN and track nothing.
+        _mu = a.get("pact1_forget", None)
+        self.pact1_forget = _P1_MU_AUTO if _mu is None else float(_mu)
         self.pact1_p0 = float(a.get("pact1_p0", 10.0))            # RLS prior looseness
         self.pact1_assist = int(a.get("pact1_assist", 1))
         #   1 = the env applies the pre-shift (a real compensator, Ant's structure);
@@ -1320,7 +1352,7 @@ class StarCraft2Env(MultiAgentEnv):
         print(
             f"[NS] SMAC CTI  severity={self.snd_severity}  mode={mode}  "
             f"curriculum={curr}  eval={self.snd_eval}  dephase={int(_DEPHASE)}  "
-            f"phi={_PHI}  knee={_KNEE} lmax={_LMAX}"
+            f"phi={_PHI}  knee={_KNEE} lmax={_LMAX}  period={_PERIOD}"
             f"   (severity 0 == stock SMAC)",
             flush=True,
         )
@@ -1555,9 +1587,14 @@ class StarCraft2Env(MultiAgentEnv):
             #           is ~1; > 2 means the compensator is inventing deflection.
             "p1_trP": float(np.mean([np.trace(r.P) for r in self._p1_rls])),
             "p1_innov": float(np.mean([r.innov_ema for r in self._p1_rls])),
+            # GUARD HARD, NOT WITH AN EPSILON (guide II.7).  At the driver trough
+            # ell is genuinely ~0, so the ratio is meaningless there -- a 1e-6 floor
+            # let trough steps dominate the column average and it read 300-900x on a
+            # run whose estimator was merely mistracking by 2x.  NaN is dropped by
+            # the runner's _m(); 0.05 is ~10% of the peak deflection.
             "p1_ell_ratio": (
                 float(self._p1_ellhat.mean() / self._cwo_ell.mean())
-                if float(self._cwo_ell.mean()) > 1e-6 else float("nan")
+                if float(self._cwo_ell.mean()) > 0.05 else float("nan")
             ),
             # over the units that actually took a shot -- k is what sets the quantum,
             # so a unit with no target list has no gate to be open or shut
