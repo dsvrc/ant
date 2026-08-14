@@ -326,6 +326,49 @@ def t10_null_warmup_poisons(rng):
     print("       input-equivalent to blind for the whole warmup.")
 
 
+def t12_dither_is_linear(rng):
+    """*** WHY THE CHANNEL IS DITHERED -- the property that makes SMAC like Ant. ***
+
+    round():  cancellation is all-or-nothing and there is a dead zone below
+              ell = 0.5/(K-1) where the sensor emits pure zeros.
+    dither:   unbiased at every ell, exact when ell_hat == ell, and the miss
+              probability is LINEAR in the estimation error.
+    """
+    K = 5
+    q = K - 1
+    # (a) unbiased at every ell -- no dead zone
+    worst = 0.0
+    for ell in (0.02, 0.05, 0.10, 0.30, 0.60, 0.90):
+        us = rng.random(20000)
+        s = np.array([shift_from_ell(ell, K, u) for u in us])
+        worst = max(worst, abs(s.mean() - ell * q))
+        if ell <= 0.10:
+            assert shift_from_ell(ell, K) == 0, "round() has a dead zone here"
+            assert s.mean() > 0.0, "dither must still carry information"
+    print(f"T12 dithered shift is UNBIASED: max |E[s] - ell*(K-1)| = {worst:.4f}")
+    assert worst < 0.02, worst
+
+    # (b) exact cancellation when the estimate is exact
+    for ell in (0.07, 0.33, 0.81):
+        us = rng.random(2000)
+        assert all(shift_from_ell(ell, K, u) == shift_from_ell(ell, K, u) for u in us)
+
+    # (c) miss probability is LINEAR in |ell - ell_hat|
+    print(f"    {'|ell-ell_hat|':>14}{'P(s_hat != s)':>16}{'predicted':>12}")
+    for derr in (0.0, 0.05, 0.10, 0.20):
+        us = rng.random(20000)
+        ell = 0.45
+        miss = np.mean([
+            shift_from_ell(ell, K, u) != shift_from_ell(ell + derr, K, u) for u in us
+        ])
+        pred = min(1.0, derr * q)
+        print(f"    {derr:>14.2f}{miss:>16.3f}{pred:>12.3f}")
+        assert abs(miss - pred) < 0.03, (derr, miss, pred)
+    print("    -> a partly-right estimate buys a partly-right outcome, exactly as on")
+    print("       Ant's continuous channel. With round() it bought a THIRD wrong")
+    print("       target, which is why cancel plateaued at 0.64.             OK")
+
+
 def main():
     print("=" * 72)
     print("SMAC PACT-1 ARITHMETIC CERTIFICATE (pure numpy, no StarCraft II)")
@@ -343,6 +386,7 @@ def main():
     t9_trace_confidence_disarms(rng)
     t10_null_warmup_poisons(rng)
     t11_resolvability_gate(rng)
+    t12_dither_is_linear(rng)
     print("=" * 72)
     print("ALL SMAC PACT-1 TESTS PASSED")
     print("=" * 72)

@@ -296,12 +296,52 @@ def predict_ell(beta, psi):
                         np.asarray(psi, dtype=np.float64)))
 
 
-def shift_from_ell(ell, k):
+def shift_from_ell(ell, k, u=None):
     """The env's harm channel: how many places along the K attackable enemies the
-    delivered target is displaced. Deterministic given ell and K."""
+    delivered target is displaced.
+
+    *** DITHERED (u is not None) IS THE DEFAULT AND IT IS THE WHOLE BALLGAME. ***
+
+    ``u`` in [0,1) is the unit's own SUB-TARGET AIM OFFSET this step -- where inside
+    the current target's angular width its aim point sits.  The deflection is a
+    continuous angle z = ell*(K-1); which enemy actually gets hit is
+    ``floor(z + u)``.  Nothing random about it from the unit's point of view: it
+    chose its own aim point and it knows u.
+
+    Why this and not round():
+
+    round() is a DETERMINISTIC QUANTISER, and it has two properties that between
+    them make the channel uncompensable in practice.
+      1. It is BIASED and has a DEAD ZONE.  For ell < 0.5/(K-1) it returns 0 for
+         every reading, so the sensor emits pure zeros -- indistinguishable from
+         "there is no coupling" -- and the estimator learns beta = 0 with rising
+         confidence.  That is the entire curriculum ramp on 3s5z.
+      2. Cancellation is ALL-OR-NOTHING.  s_hat must equal s EXACTLY or the shot
+         lands on a third, unrelated enemy.  The tolerance is 0.5/(K-1) -- which is
+         precisely the sensor's own resolution.  There is no headroom at all, and
+         the estimator cannot average its way to more precision because beta*
+         moves with the driver.  Measured: cancel plateaued at 0.64 and the win
+         rate still sat at 0.105.
+
+    Dithering fixes both, and gives back the property that makes Ant work:
+      * UNBIASED at every severity -- E[s] = z exactly, so at small ell the shot is
+        displaced with probability ell*(K-1) instead of never.  Information flows
+        from step one; the dead zone is gone.
+      * EXACT cancellation is preserved.  With the same u, ell_hat == ell gives
+        s_hat == s identically, so T2 conjugacy still holds byte for byte.
+      * The miss probability is LINEAR in the estimation error:
+            P(s_hat != s) = |z - z_hat| = |ell - ell_hat| * (K-1)
+        so a partly-right estimate now buys a partly-right outcome, exactly as on
+        Ant's continuous channel, instead of buying a different wrong target.
+
+    Passing u=None restores the old deterministic quantiser (ablation only).
+    """
     if k <= 1:
         return 0
-    return int(round(float(np.clip(ell, 0.0, 1.0)) * (k - 1)))
+    z = float(np.clip(ell, 0.0, 1.0)) * (k - 1)
+    if u is None:
+        return int(round(z))
+    return int(np.clip(np.floor(z + float(u)), 0, k - 1))
 
 
 def ell_from_shift(s, k):

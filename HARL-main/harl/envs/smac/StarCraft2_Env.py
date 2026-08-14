@@ -416,6 +416,26 @@ _P1_MU_AUTO = float(np.clip(
     1.0 - 1.0 / max(2.0, _P1_MEM_FRAC * _PERIOD * _P1_READ_RATE), 0.90, 0.9995
 ))
 
+# ###########################################################################
+# ###  DITHERED DEFLECTION -- the channel property that makes SMAC == ANT. ##
+# ###########################################################################
+# The delivered target is  floor(ell*(K-1) + u)  where u in [0,1) is the unit's own
+# sub-target aim offset this step, instead of  round(ell*(K-1)).  See
+# pact/pact1_core.shift_from_ell for the full argument; in one line: round() has a
+# dead zone below ell = 0.5/(K-1) (so the sensor emits pure zeros through the whole
+# curriculum ramp) and demands EXACT integer agreement to cancel (tolerance
+# 0.5/(K-1), which is the sensor's own resolution -- zero headroom).  Dithering is
+# unbiased at every severity, preserves exact cancellation when ell_hat == ell, and
+# makes the miss probability LINEAR in |ell - ell_hat| instead of a step function.
+#
+# It also makes the channel BITE HARDER on a blind team at low ell: a deflection of
+# ell = 0.1 on a 5-target list now displaces the shot 40% of the time instead of
+# never.  The harm is graded across the whole driver cycle rather than switching on
+# at a threshold.
+#
+# Set SMAC_SND_DITHER=0 to restore the deterministic quantiser (ablation).
+_DITHER = os.environ.get("SMAC_SND_DITHER", "1").lower() not in ("0", "false", "", "no")
+
 _P1KREF = float(os.environ.get("SMAC_SND_KREF", "5"))
 #                 reference target-list size at which a deflection reading counts as
 #                 variance 1.  Only ratios matter (see _pact1_observe); 5 is the
@@ -625,6 +645,11 @@ class StarCraft2Env(MultiAgentEnv):
         self._cwo_reward_raw = 0.0   # delta_enemy + delta_deaths BEFORE abs()
         self._snd_sigma_applied = 0.0                             # curriculum severity this step
         self._cwo_rng = np.random.RandomState(0)  # weapon-jam RNG; re-seeded in seed()
+        # The unit's own sub-target aim offset, redrawn every step.  Dedicated RNG so
+        # it never perturbs the game stream (same discipline as Ant's _sensor_rng),
+        # and it exists for EVERY arm -- the channel is the same for blind and PACT-1.
+        self._aim_rng = np.random.RandomState(4000 + int(_PACT1_SEED))
+        self._cwo_dither = np.zeros(self.n_agents)
         self._pact1_init_state()
         self._snd_payload = 0.0                                    # A(t)
         self._snd_load_mean = 0.0
@@ -971,6 +996,15 @@ class StarCraft2Env(MultiAgentEnv):
         # applies it (from the end of the previous step).  Reset this step's drop
         # record; get_agent_action sets _cwo_dropped[i]=1 when unit i's shot jams.
         self._cwo_dropped = np.zeros(self.n_agents, dtype=np.float32)
+        # This step's sub-target aim offsets.  Drawn ONCE per step, BEFORE any agent
+        # acts, and read by BOTH the compensator's pre-shift and the channel's
+        # deflection inside get_agent_action -- they must see the same u or exact
+        # cancellation is impossible.  Drawn for every arm; blind simply never reads
+        # it for compensation.
+        self._cwo_dither = (
+            self._aim_rng.random_sample(self.n_agents) if _DITHER
+            else np.zeros(self.n_agents)
+        )
         # PACT-1 per-step sensor buffers. Cleared HERE, before get_agent_action fills
         # them, and read by _pact1_observe inside _snd_step -- which runs after all
         # the actions have been applied, so every unit's reading is present.
@@ -1352,7 +1386,8 @@ class StarCraft2Env(MultiAgentEnv):
         print(
             f"[NS] SMAC CTI  severity={self.snd_severity}  mode={mode}  "
             f"curriculum={curr}  eval={self.snd_eval}  dephase={int(_DEPHASE)}  "
-            f"phi={_PHI}  knee={_KNEE} lmax={_LMAX}  period={_PERIOD}"
+            f"phi={_PHI}  knee={_KNEE} lmax={_LMAX}  period={_PERIOD}  "
+            f"dither={int(_DITHER)}"
             f"   (severity 0 == stock SMAC)",
             flush=True,
         )
@@ -2029,7 +2064,8 @@ class StarCraft2Env(MultiAgentEnv):
             )
         ):
             s_hat = _p1_shift_from_ell(
-                self.pact1_gpol * float(self._p1_ellhat[a_id]), k
+                self.pact1_gpol * float(self._p1_ellhat[a_id]), k,
+                float(self._cwo_dither[a_id]) if _DITHER else None,
             )
             if s_hat > 0:
                 cur0 = int(action - self.n_actions_no_attack)
@@ -2047,7 +2083,12 @@ class StarCraft2Env(MultiAgentEnv):
             and float(self._cwo_ell[a_id]) > 0.0
         ):
             if k > 1:
-                s = int(round(float(self._cwo_ell[a_id]) * (k - 1)))
+                # SAME u as the pre-shift above: with ell_hat == ell the two shifts
+                # are identical and the channel cancels exactly (T2 conjugacy).
+                s = _p1_shift_from_ell(
+                    float(self._cwo_ell[a_id]), k,
+                    float(self._cwo_dither[a_id]) if _DITHER else None,
+                )
                 if s > 0:
                     cur = int(action - self.n_actions_no_attack)
                     pos = int(np.where(tgts == cur)[0][0])
@@ -2062,7 +2103,9 @@ class StarCraft2Env(MultiAgentEnv):
         if self.snd_pact1 and action >= self.n_actions_no_attack and k > 1:
             ell_true = float(self._cwo_ell[a_id])
             self._p1_sobs[a_id] = float(
-                int(round(ell_true * (k - 1))) if self.snd_severity != 0.0 else 0
+                _p1_shift_from_ell(
+                    ell_true, k, float(self._cwo_dither[a_id]) if _DITHER else None
+                ) if self.snd_severity != 0.0 else 0
             )
             self._p1_kobs[a_id] = k
 
