@@ -436,6 +436,12 @@ _P1_MU_AUTO = float(np.clip(
 # Set SMAC_SND_DITHER=0 to restore the deterministic quantiser (ablation).
 _DITHER = os.environ.get("SMAC_SND_DITHER", "1").lower() not in ("0", "false", "", "no")
 
+# Stock SMAC's abs() in reward_battle PAYS the team for enemy shield regeneration,
+# which makes the 150-step timeout an absorbing, PROFITABLE state.  Default OFF (we
+# use max(0, .) instead); set SMAC_SND_REGENPAY=1 to restore stock behaviour.
+# See reward_battle for the full argument and the measured numbers.
+_REGENPAY = os.environ.get("SMAC_SND_REGENPAY", "0").lower() not in ("0", "false", "", "no")
+
 _P1KREF = float(os.environ.get("SMAC_SND_KREF", "5"))
 #                 reference target-list size at which a deflection reading counts as
 #                 variance 1.  Only ratios matter (see _pact1_observe); 5 is the
@@ -1335,7 +1341,19 @@ class StarCraft2Env(MultiAgentEnv):
         # quantum (1/(k-1)) on its current target list.  0.5 = "my typical error is
         # under half a place".  Set <=0 to disable (restores the old covariance-only
         # gate and with it the ability to do worse than blind).
-        self.pact1_resolve = float(a.get("pact1_resolve", 0.5))
+        # *** THE THRESHOLD DEPENDS ON THE CHANNEL, AND DITHERING CHANGES IT. ***
+        # On the DETERMINISTIC channel a wrong integer lands the shot on a third,
+        # unrelated enemy, so the gate had to be a precision test: 0.5 = "half a
+        # place".  On the DITHERED channel P(miss) = |z - z_hat|, so compensating
+        # helps for ANY ell_hat in (0, 2*ell) -- partial estimates buy partial
+        # recovery and a tight gate only blocks shots it should let through.
+        # Worse, `innov` includes the dither's own measurement noise, whose sd IS
+        # 0.5/(k-1): a 0.5 threshold demands the residual fall below the irreducible
+        # noise floor, which it cannot.  Measured: armed capped at 0.64 and usually
+        # 0.3, i.e. 40-70% of beneficial compensations were being refused.
+        # So under dithering this is a DIVERGENCE guard (2 quanta), not a precision
+        # gate.  Set 0 to disable entirely.
+        self.pact1_resolve = float(a.get("pact1_resolve", 2.0 if _DITHER else 0.5))
         self.pact1_ctde = int(a.get("pact1_ctde", 0))             # true A -> critic only
         # de-phasing: this env's starting point on the driver cycle, in [0,1).  Set by
         # make_train_env / make_eval_env from the worker rank so the ensemble tiles the
@@ -1387,7 +1405,13 @@ class StarCraft2Env(MultiAgentEnv):
             f"[NS] SMAC CTI  severity={self.snd_severity}  mode={mode}  "
             f"curriculum={curr}  eval={self.snd_eval}  dephase={int(_DEPHASE)}  "
             f"phi={_PHI}  knee={_KNEE} lmax={_LMAX}  period={_PERIOD}  "
-            f"dither={int(_DITHER)}"
+            f"dither={int(_DITHER)}  regen_pay={int(_REGENPAY)}"
+            + ("" if _REGENPAY else
+               "\n[NS] reward_battle: abs() -> max(0,.) -- stock SMAC pays the team "
+               "for ENEMY SHIELD REGENERATION,\n     which makes the 150-step timeout "
+               "an absorbing PROFITABLE state and is what ended every prior run.\n"
+               "     Applies identically to every arm. DISCLOSE IT: absolute returns "
+               "are not comparable with published SMAC numbers.")
             f"   (severity 0 == stock SMAC)",
             flush=True,
         )
@@ -2361,7 +2385,31 @@ class StarCraft2Env(MultiAgentEnv):
                     delta_enemy += prev_health - e_unit.health - e_unit.shield
 
         if self.reward_only_positive:
-            reward = abs(delta_enemy + delta_deaths)  # shield regeneration
+            # *** STOCK SMAC PAYS THE TEAM FOR ENEMY SHIELD REGENERATION. ***
+            # delta_enemy sums (prev_health + prev_shield) - (health + shield) over
+            # living enemies.  Protoss shields regenerate out of combat, so on a step
+            # where the team deals no damage that sum goes NEGATIVE -- and abs()
+            # turns it into positive reward.  A squad that backs off and lets 8
+            # enemies regenerate is PAID for it, and paid more the longer it stalls.
+            #
+            # That is what makes the 150-step timeout an ABSORBING, PROFITABLE state,
+            # and it is what has ended every 3s5z run here -- on the blind arm at
+            # severity 0 (StarCraft2_Env.py:228) and on PACT-1 at every severity
+            # tried.  Measured on the dithered sigma=1.0 run: fire_avail 0.90 -> 0.23
+            # and ep_len 53 -> 150 within 750 rollouts of the ramp, then 16M steps
+            # with no recovery.  With the escape available, no severity separates the
+            # arms: whichever one is hurt first walks into the basin and stays.
+            #
+            # max(0, .) removes the payment for the ENEMY HEALING and nothing else.
+            # Damage dealt, kills and the win bonus are untouched, the reward is
+            # never made negative, and it applies IDENTICALLY to every arm -- so it
+            # is a sign fix, not a change to the non-stationarity (guide I.2
+            # constraint 3 is about not penalising the agent, which this does not do).
+            # *** DISCLOSE IT: it is a deviation from stock SMAC and it changes the
+            # absolute return scale, so published SMAC numbers are not comparable. ***
+            # SMAC_SND_REGENPAY=1 restores the stock abs() for an ablation.
+            raw_r = delta_enemy + delta_deaths
+            reward = abs(raw_r) if _REGENPAY else max(0.0, raw_r)
         else:
             reward = delta_enemy + delta_deaths - delta_ally
 
@@ -2381,7 +2429,11 @@ class StarCraft2Env(MultiAgentEnv):
         # r_step_mean: if it is a large share, the basin is a reward artifact and no
         # amount of method work will climb out of it.
         raw = float(delta_enemy + delta_deaths)
-        self._cwo_regen_pay = float(-raw) if (self.reward_only_positive and raw < 0.0) else 0.0
+        # the payment ACTUALLY MADE, so regen_frac stays a true share of r_step_mean:
+        # 0 once the sign fix is on, and the stock value under SMAC_SND_REGENPAY=1.
+        self._cwo_regen_pay = float(-raw) if (
+            _REGENPAY and self.reward_only_positive and raw < 0.0
+        ) else 0.0
         self._cwo_reward_raw = raw
 
         return reward
