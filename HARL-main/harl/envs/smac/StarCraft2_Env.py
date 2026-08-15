@@ -1412,7 +1412,7 @@ class StarCraft2Env(MultiAgentEnv):
                "an absorbing PROFITABLE state and is what ended every prior run.\n"
                "     Applies identically to every arm. DISCLOSE IT: absolute returns "
                "are not comparable with published SMAC numbers.")
-            f"   (severity 0 == stock SMAC)",
+            + f"(severity 0 == stock SMAC)",
             flush=True,
         )
         if _PHI == "alive":
