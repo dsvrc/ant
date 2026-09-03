@@ -209,19 +209,73 @@ def sweep_k_scale(map_name, values, steps, mock, seed, ctl=None):
     return rows
 
 
-def sweep_severity(map_name, values, steps, mock, seed, ctl=None):
-    print("severity sweep -- gate G3 ('a dial that does not hurt is not a dial')")
-    print("  %-8s %-11s %-11s %-10s %-9s %-9s %s"
-          % ("sigma", "delta_mean", "dial_ratio", "stride", "ret", "ep_len", "peer_share"))
+def sweep_severity(map_name, values, steps, mock, seed, ctl=None, k_scale=None):
+    """The second dial lever, reported on the same terms as k_scale.
+
+    Weaker than k_scale by construction -- g floors at ``ns_floor``, so mean
+    (1 - g) only about doubles between sigma=1 and sigma=3, where k_scale spans
+    ~4x over its range -- but it stacks with it.  Run it AT the calibrated
+    k_scale, not at the default.
+
+    WATCH ``deliv_rec``.  It is the oracle's ability to restore delivery, and it
+    falls as the dial strengthens because the correction rails at the unit's own
+    one-step reach (a command past it buys nothing).  Once it drops far below 1.0
+    the compensator can no longer undo the channel, and pushing the dial harder
+    stops buying a bigger gap and starts destroying the conjugacy result instead.
+    """
+    ctl = ctl or reference_action
+    base = {} if k_scale is None else {"ns_k_scale": float(k_scale)}
+    top, fc, env = _build(map_name, dict(base, ns_severity=0.0), mock, seed)
+    r0 = _drive(top, fc, env, steps, seed, ctl)
+    env.close()
+    print("severity sweep on %s%s -- sigma=0 reference: ret %.2f, deliv %.3f"
+          % (map_name, "" if k_scale is None else " at k_scale=%.3f" % k_scale,
+             r0["ret"], r0["deliv"]))
+    print("  %-8s %-8s %-8s %-15s %-8s %-9s %-8s %s"
+          % ("sigma", "delta", "deliv", "ret vs s=0", "G4b", "deliv_rec",
+             "ep_len", "verdict"))
     rows = []
     for s in values:
-        top, fc, env = _build(map_name, {"ns_severity": float(s)}, mock, seed)
-        r = _drive(top, fc, env, steps, seed, ctl or reference_action)
+        cfg = dict(base, ns_severity=float(s))
+        top, fc, env = _build(map_name, cfg, mock, seed)
+        r = _drive(top, fc, env, steps, seed, ctl)
         env.close()
-        print("  %-8.2f %-11.4f %-11.3f %-10.3f %-9.2f %-9.1f %.3f"
-              % (s, r["delta"], r["dial_ratio"], r["stride"], r["ret"],
-                 r["ep_len"], r["peer_share"]))
-        rows.append(dict(sigma=float(s), **r))
+        top, fc, env = _build(map_name, cfg, mock, seed)
+        rp = _drive(top, fc, env, steps, seed, ctl, privileged=True)
+        env.close()
+        hurt = r0["ret"] - r["ret"]
+        h2se = 2.0 * float(np.hypot(r0["ret_se"], r["ret_se"]))
+        g4b = rp["ret"] / max(1e-9, r["ret"])
+        lost = r0["deliv"] - r["deliv"]
+        rec = (rp["deliv"] - r["deliv"]) / lost if lost > 1e-6 else float("nan")
+        ret_rec = (rp["ret"] - r["ret"]) / hurt if hurt > 0.3 else float("nan")
+        why = []
+        if g4b < 1.30:
+            why.append("G4b %.2f < 1.30" % g4b)
+        if hurt <= h2se:
+            why.append("hurt inside noise")
+        if r["ret"] < 0.35 * r0["ret"]:
+            why.append("team collapsed")
+        if np.isfinite(rec) and rec < 0.85:
+            why.append("oracle railing (deliv_rec %.2f)" % rec)
+        ok = not why
+        rows.append(dict(sigma=float(s), ok=bool(ok), g4b=float(g4b),
+                         deliv_rec=float(rec), ret_rec=float(ret_rec),
+                         hurt=float(hurt), hurt_2se=float(h2se), ret0=r0["ret"],
+                         ret_priv=rp["ret"], k_scale=k_scale, **r))
+        print("  %-8.2f %-8.3f %-8.3f %-15s %-8.3f %-9.2f %-8.0f %s"
+              % (s, r["delta"], r["deliv"],
+                 "%.1f (-%.1f/%.1f)" % (r["ret"], hurt, h2se), g4b, rec,
+                 r["ep_len"], "OK" if ok else ", ".join(why)))
+    pv = [x["ret_priv"] for x in rows]
+    print("  privileged return across the whole sweep: %.2f .. %.2f against a "
+          "sigma=0 line of %.2f" % (min(pv), max(pv), r0["ret"]))
+    print("  (flat AT that line == the compensator restores the stationary game "
+          "at every severity -- T2 conjugacy, and a stronger claim than the ratio)")
+    good = [r for r in rows if r["ok"]]
+    if good:
+        print("  -> ns_severity: %.2f is the weakest severity that clears G4b"
+              % min(r["sigma"] for r in good))
     return rows
 
 
@@ -290,6 +344,9 @@ def main(argv=None):
     ap.add_argument("--map", default="1c3s5z")
     ap.add_argument("--controller", default="best",
                     choices=["best", "focus", "kite"])
+    ap.add_argument("--k_scale", type=float, default=None,
+                    help="fix ns_k_scale while sweeping severity -- run the "
+                         "severity lever AT the calibrated dial, not the default")
     ap.add_argument("--steps", type=int, default=6000)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--values", default="", help="comma-separated override")
@@ -311,7 +368,11 @@ def main(argv=None):
     if args.mock:
         print("*** --mock: these numbers are from a TEST DOUBLE and calibrate "
               "nothing.  Commit only numbers from a real StarCraft II run. ***")
-    rows = fn(args.map, vals, args.steps, args.mock, args.seed, ctl)
+    if args.sweep == "severity":
+        rows = fn(args.map, vals, args.steps, args.mock, args.seed, ctl,
+                  k_scale=args.k_scale)
+    else:
+        rows = fn(args.map, vals, args.steps, args.mock, args.seed, ctl)
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump(dict(sweep=args.sweep, map=args.map, seed=args.seed,

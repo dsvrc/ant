@@ -1,21 +1,31 @@
-map_name: 3s_vs_5z
-# 3s_vs_5z, not 3s5z, and the reason is MEASURED (fc/certificates.py --headroom):
-#   map          focus-fire s=0   kiting s=0   movement headroom
-#   3s_vs_5z          3.64          11.13          3.06x     <- movement IS the task
-#   3s5z             13.21          10.91          0.83x     <- a stand-and-shoot slug
-# The harm channel is a stride throttle, so it can only transmit to reward where
-# movement decides something.  On 3s5z a PERFECT oracle on the true deficit gained
-# 1.029; on 3s_vs_5z with a control that actually uses movement it gains 1.258 and
-# recovers 73% of what the dial costs.
+map_name: 1c3s5z
+# CALIBRATED, not chosen.  Two measurements picked this map and one picked the
+# dial, all before any method ran; k2.json / fc_headroom*.json hold the output.
 #
-# *** OPEN, AND IT MATTERS: 3s_vs_5z's ally squad is 3 Stalkers, so the declared
-# operator is UNIFORM there -- spread 0.000, asymmetry 0.000.  It is still the
-# true operator (a homogeneous squad really has no structure), but the "declared
-# operator beats a geometric proxy" ABLATION cannot be run on it, because a proxy
-# would reproduce it exactly.  The maps with a real operator are 2s3z (spread
-# 1.073), 1c3s5z (0.992, asym 0.333) and 3s5z (0.957) -- none of which has been
-# headroom-tested except 3s5z, which failed it.  Settle that before committing:
-#     python -m harl.envs.smac.fc.certificates --headroom 1c3s5z,2s3z,MMM2 ***
+#   movement headroom (a movement-competent control vs focus-fire, at sigma=0):
+#     1c3s5z 1.77x   3s_vs_5z 3.06x   2s3z 0.84x   3s5z 0.83x   MMM2 0.78x
+#   declared operator structure (spread / asymmetry / max:min):
+#     1c3s5z 0.992 / 0.333 / 28x      <- the best in the benchmark
+#     3s_vs_5z 0.000 / 0.000 / 1.0x   <- DEGENERATE: 3 Stalkers, one unit type,
+#                                        so the "operator beats a proxy" ablation
+#                                        cannot be run there at all
+#   1c3s5z is the only map that has BOTH.
+ns_k_scale_note: |
+  k_scale = 0.08 from the sweep in k2.json (1c3s5z, kite control, ~110 episodes
+  per row).  Across all six dial strengths the PRIVILEGED oracle returned
+  19.49 +- 0.14 against a sigma=0 line of 19.43 -- flat, at the line, at every
+  severity.  The blind arm meanwhile fell monotonically 19.44 -> 17.14.  At
+  k_scale = 0.08 the dial costs the blind arm 2.29 (t = 6.0) and the oracle
+  recovers 97% of it.  The three strongest dials (0.08 / 0.12 / 0.18) are
+  statistically indistinguishable in G4b, so the result does not balance on the
+  constant.
+  G4b = 1.130, BELOW the spec's 1.30 bar, and that is recorded here rather than
+  worked around: G4b is a RATIO, and the ratio is capped by how much the dial can
+  cost, which on this map is ~12% because the reference already wins at 97% of
+  the maximum return.  The substantive requirement -- "is there a gap for a
+  method to close" -- is met at t = 6.0 and a perfect compensator closes 97% of
+  it.  Whether that is enough is a judgement, and it must be recorded BEFORE the
+  method runs, not after.
 state_type: FP # choose from FP (Feature Pruned) and EP (Environment Provided)
 
 # ===========================================================================
@@ -50,8 +60,9 @@ ns_depth: 0.60        # capacity shrink at sigma=1, A=1.  The sigma=1 anchor;
                       # fc/certificates.py measures the game's own congestion
 ns_floor: 0.25        # g never drops below this
 ns_harm_max: 0.75     # Delta cap -- a unit is never fully immobilised
-ns_k_scale: 0.35      # the medium's units.  Declared; frozen by fc/calibrate.py
-                      # BEFORE any method runs, and identical for every arm
+ns_k_scale: 0.08      # the medium's units.  CALIBRATED on this map against the
+                      # measured-stronger control (k2.json); see ns_k_scale_note.
+                      # Frozen before any method runs, identical for every arm.
 ns_phi_fire: 1.0      # Phi_j = alive_j * (1 + phi_fire * fired_j).  alive is the
                       # UNCANCELLABLE floor (A.5); firing is what makes it vary
 ns_phi_rho: 0.6       # obstruction has inertia -- ~3-step memory.  This is what
