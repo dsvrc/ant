@@ -116,7 +116,41 @@ orders issued are *identical* to the blind arm's — asserted, not promised:
 
 ---
 
-## 4. The runbook
+## 4. Choosing the map — MEASURED, and it decided the project
+
+The harm channel is a stride throttle, so it can only reach reward on a map where
+movement decides something, and PACT's "declared operator, not a proxy" claim
+only means anything on a map whose squad is heterogeneous enough to give the
+operator structure. Both were measured before any training:
+
+```
+map         headroom  kite s=0  dial cost/2se   G4b     mv_frac  W_spread  W_asym
+3s_vs_5z      3.06      11.1     +2.90/2.54 *   1.258    0.70     0.000     0.000  <- degenerate W
+1c3s5z        1.77      19.5     +0.79/1.19     1.062    0.40     0.992     0.333  <- best operator
+2s3z          0.84      13.1     -0.91/2.29     0.972    0.55     1.073     0.242
+3s5z          0.83      10.9     +0.62/0.72     1.054    0.50     0.957     0.242
+MMM2          0.78       3.8     +0.00/0.21     1.085    0.65     0.217     0.379
+```
+
+`headroom` = return of a movement-competent control over a focus-fire one at
+sigma=0. Below ~1.15 the map cannot transmit a movement channel to reward at
+all, and **five of eight maps in the first scan failed for that reason alone**,
+including 3s5z, where the fight is a stand-and-shoot slugfest.
+
+Two facts that cost a scan each and are worth stating plainly:
+
+* **A control with no movement skill makes the gates unreadable.** The first
+  reference focus-fired and walked at the enemy; against it a PERFECT oracle
+  gained 1.03 on 3s5z and *lost* on 2c_vs_64zg, where the dial IMPROVED the
+  reference by 1.73 (2se 0.86) — degrading a harmful behaviour is not a harm.
+  D.1's warning, arriving from the other direction. `pick_controller` now
+  measures both controls at sigma=0 and takes the stronger, printing both.
+* **A Delta band is the wrong calibration target.** At the same delivery loss
+  (deliv 0.853 vs 0.860) the return cost was **4% on 1c3s5z and 26% on
+  3s_vs_5z** — a 6x difference in transmission that no Delta band can see. The
+  k_scale sweep therefore runs the oracle on every row and calibrates on **G4b**.
+
+## 5. The runbook
 
 ### Step 1 — the arithmetic (seconds, no StarCraft II)
 
@@ -133,35 +167,37 @@ arithmetic is not the reason if it does not.
 python -m harl.envs.smac.fc.certificates --offline --out fc_ceiling.json
 ```
 
-Prints Part C's table. **Read it before running anything** — if the coordination
-gap were small this environment would be a poor showcase however good the method.
-
-### Step 3 — the live gates (needs StarCraft II). Commit the output.
+### Step 3 — is movement worth return on this map?
 
 ```bash
-python -m harl.envs.smac.fc.certificates --map 3s5z --episodes 8 --out fc_gates.json
+python -m harl.envs.smac.fc.certificates --headroom 1c3s5z,3s_vs_5z --episodes 20 --out fc_headroom.json
 ```
 
-Runs a strong scripted reference and a privileged controller across severities
-and reports G0, G0b, G3, G4a, G4b, G5, G6, G7 plus the sigma=1 anchor. Commit
-`fc_gates.json` **before** any method run — the history is the evidence you did
-not retune after seeing a method fail.
+If `headroom` is not comfortably above 1.15, stop: no stride channel can matter
+there, whatever the dial is set to.
 
-### Step 4 — freeze the task constants
+### Step 4 — calibrate the dial ON THAT MAP, against the control that won
 
 ```bash
-python -m harl.envs.smac.fc.calibrate --sweep k_scale  --steps 6000 --out k.json
-python -m harl.envs.smac.fc.calibrate --sweep severity --steps 6000 --out s.json
-python -m harl.envs.smac.fc.calibrate --sweep mu       --steps 40000 --out mu.json
+python -m harl.envs.smac.fc.calibrate --sweep k_scale --map 1c3s5z --steps 8000 --out k.json
 ```
 
-Write the chosen `ns_k_scale` into `harl/configs/envs_cfgs/smac.yaml` and freeze
-it. Add `--mock` to exercise any sweep with no StarCraft II installed — those
-numbers calibrate nothing and the script says so.
+Each row runs the privileged oracle too, so the sweep reports **G4b** directly.
+Take the *weakest* dial that clears 1.30 while the team still fights, write it
+into `smac.yaml`, and **commit this output before any method run** — E.2 pitfall
+10: *"retuning after seeing a method fail plants the problem; the history is the
+evidence that you did not."*
 
-### Step 5 — only then train.
+### Step 5 — the full gates, with enough episodes to resolve G4b
 
----
+```bash
+python -m harl.envs.smac.fc.certificates --map 1c3s5z --episodes 60 --out fc_gates.json
+```
+
+20 episodes leaves G4b with a standard error of ~0.15, which straddles the 1.30
+bar. Commit the output.
+
+### Step 6 — only then train.
 
 ## 5. Commands
 
@@ -390,9 +426,13 @@ the old file aside instead.
    `Delta(t+1)` the stale local sensor plus the known driver model already
    explains. That residual, not the source share, is what peer anticipation can
    actually buy, and it is what `fit_gain` measures online.
-5. **The harm only reaches a unit that is moving.** `move_frac` is therefore a
-   first-class diagnostic, and a policy that plants and shoots feels less of the
-   dial. Gate G7 measures it on the real environment.
+5. **The harm only reaches a unit that is moving, and only matters where movement
+   decides the fight.** Measured: five of eight SMAC maps have a movement
+   headroom at or below 1.05, i.e. a movement-competent control buys no return
+   over a focus-fire one, and on those maps a perfect oracle on the true deficit
+   gains nothing. That is a fact about SMAC, not about the method, and it is why
+   the map is chosen on the gates (section 4) rather than by preference.
+   `move_frac` and `headroom` are first-class diagnostics.
 6. **First-order geometry.** The obstruction model is a Minkowski corridor with a
    proximity and a direction kernel; it ignores pathing, terrain and SC2's own
    collision resolution. Compensation acts on the commanded distance, so the

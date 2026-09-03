@@ -64,7 +64,7 @@ def _build(map_name, cfg, mock=False, seed=0):
     return (PactEnv(fc, cfg) if int(cfg.get("pact", 0)) else fc), fc, env
 
 
-def _drive(top, fc, env, steps, seed=0, controller=None):
+def _drive(top, fc, env, steps, seed=0, controller=None, privileged=False):
     """Roll a scripted controller and return the measured facts.
 
     The per-step diagnostics are ACCUMULATED, not read once at the end: the
@@ -75,8 +75,10 @@ def _drive(top, fc, env, steps, seed=0, controller=None):
     rng = np.random.RandomState(seed)
     top.reset()
     ep_r, eps, lens, t_ep = 0.0, [], [], 0
+    u_hat = np.zeros(fc.n_agents)
     acc = {k: [] for k in ("delta", "u", "stride", "peer_share", "dnz", "trust",
                            "fit_gain", "ff", "peer")}
+    deliv = []
     for _ in range(int(steps)):
         av = env.get_avail_actions()
         if controller is None:
@@ -86,10 +88,23 @@ def _drive(top, fc, env, steps, seed=0, controller=None):
                 acts.append(int(rng.choice(ok)) if ok.size else 0)
         else:
             acts = [controller(env, i, av[i]) for i in range(env.n_agents)]
+        if privileged:
+            # the exact channel inverse on the TRUE deficit, with the driver model
+            # known, so it pre-empts the trough (D.1: privileged IN STRATEGY)
+            g_next = float(fc.driver.g()[0])
+            pre = np.clip(u_hat * (1.0 - g_next), 0.0, fc.harm_max)
+            fc.set_command(np.clip(1.0 / np.maximum(0.25, 1.0 - pre), 0.25, 4.0))
         out = top.step(np.array(acts).reshape(-1, 1))
+        gnow = float(fc.g)
+        if gnow < 1.0:
+            u_hat = 0.7 * u_hat + 0.3 * (fc.delta / max(1e-9, 1.0 - gnow))
         info = out[4][0]
         ep_r += float(np.asarray(out[2]).reshape(-1)[0])
         t_ep += 1
+        live_m = fc._alive > 0
+        if live_m.any():
+            deliv.append(float(np.mean((fc.stride
+                                        / np.maximum(1e-12, fc.base_frac))[live_m])))
         for k, key in (("delta", "fc_delta_mean"), ("u", "fc_u_mean"),
                        ("stride", "fc_stride_mean"), ("peer_share", "fc_peer_share"),
                        ("dnz", "pact_delta_nonzero_frac"),
@@ -113,49 +128,84 @@ def _drive(top, fc, env, steps, seed=0, controller=None):
     out = {k: m(v) for k, v in acc.items()}
     out.update(move_frac=d["fc_move_frac"], phi_var=d["fc_phi_var"],
                dial_ratio=d["fc_dial_ratio"], odom_err=d["fc_odom_err"],
-               ret=m(eps), ep_len=m(lens), n_ep=len(eps))
+               ret=m(eps), ep_len=m(lens), n_ep=len(eps),
+               ret_se=float(np.std(eps) / max(1.0, np.sqrt(len(eps)))) if eps
+               else float("nan"),
+               deliv=float(np.mean(deliv)) if deliv else float("nan"))
     return out
 
 
 def sweep_k_scale(map_name, values, steps, mock, seed, ctl=None):
-    print("k_scale sweep -- the medium's units.  Pick the row whose delta_mean is")
-    print("inside %s AND whose move_frac and phi_var are healthy, then FREEZE it."
-          % (TARGET_DELTA,))
-    print("  %-9s %-11s %-9s %-11s %-10s %-9s %s"
-          % ("k_scale", "delta_mean", "u_mean", "stride_mean", "move_frac",
-             "phi_var", "verdict"))
+    """Set the dial's strength, and set it on the number that decides everything.
+
+    The earlier version of this sweep reported ``delta_mean`` and asked whether it
+    landed in a plausible band.  That was the wrong target twice over: it was run
+    on the wrong map, against a control with no movement skill, and Delta landing
+    in band tells you nothing about whether the harm reaches REWARD.  Measured:
+    at the same delivery loss (deliv 0.853 vs 0.860) the return cost was 4% on
+    1c3s5z and 26% on 3s_vs_5z -- a 6x difference in transmission that a Delta
+    band cannot see.
+
+    So each row now runs the privileged oracle too and reports **G4b** -- what a
+    perfect compensator on the true deficit buys over blind.  That is the quantity
+    the whole campaign rests on, and no method can exceed it.
+
+    Pick the WEAKEST dial that clears the bar while the team still fights (D.2's
+    constraint: a severity that drives the team into a collapse basin measures the
+    basin, not the NS), then FREEZE it and commit this output before any method
+    run.
+    """
+    ctl = ctl or reference_action
+    top, fc, env = _build(map_name, {"ns_severity": 0.0}, mock, seed)
+    r0 = _drive(top, fc, env, steps, seed, ctl)
+    env.close()
+    print("k_scale sweep on %s -- sigma=0 reference: ret %.2f, deliv %.3f"
+          % (map_name, r0["ret"], r0["deliv"]))
+    print("  %-9s %-8s %-8s %-15s %-8s %-9s %-8s %s"
+          % ("k_scale", "delta", "deliv", "ret vs s=0", "G4b", "deliv_rec",
+             "move_fr", "verdict"))
     rows = []
     for k in values:
-        top, fc, env = _build(map_name, {"ns_severity": 1.0, "ns_k_scale": float(k)},
-                              mock, seed)
-        r = _drive(top, fc, env, steps, seed, ctl or reference_action)
+        cfg = {"ns_severity": 1.0, "ns_k_scale": float(k)}
+        top, fc, env = _build(map_name, cfg, mock, seed)
+        r = _drive(top, fc, env, steps, seed, ctl)
         env.close()
+        top, fc, env = _build(map_name, cfg, mock, seed)
+        rp = _drive(top, fc, env, steps, seed, ctl, privileged=True)
+        env.close()
+        hurt = r0["ret"] - r["ret"]
+        h2se = 2.0 * float(np.hypot(r0["ret_se"], r["ret_se"]))
+        g4b = rp["ret"] / max(1e-9, r["ret"])
+        lost = r0["deliv"] - r["deliv"]
+        rec = (rp["deliv"] - r["deliv"]) / lost if lost > 1e-6 else float("nan")
         why = []
-        if r["delta"] < TARGET_DELTA[0]:
-            why.append("delta too weak")
-        elif r["delta"] > TARGET_DELTA[1]:
-            why.append("delta too strong")
-        if not (r["move_frac"] >= TARGET_MOVE_FRAC):
-            why.append("move_frac low")     # the channel only bites on move orders
+        if g4b < 1.30:
+            why.append("G4b %.2f < 1.30" % g4b)
+        if hurt <= h2se:
+            why.append("hurt inside noise")
+        if r["ret"] < 0.35 * r0["ret"]:
+            why.append("team collapsed")        # D.2: this measures the basin
         if not (r["phi_var"] > 0.05):
-            why.append("Phi near-constant")  # A.5's counter-check
+            why.append("Phi near-constant")
         ok = not why
-        print("  %-9.3f %-11.4f %-9.3f %-11.3f %-10.3f %-9.3f %s"
-              % (k, r["delta"], r["u"], r["stride"], r["move_frac"], r["phi_var"],
-                 "OK" if ok else ", ".join(why)))
-        rows.append(dict(k_scale=float(k), ok=bool(ok), **r))
-    print("  NOTE: move_frac is a property of the CONTROLLER, not the dial -- the")
-    print("  channel only bites on move orders, so a controller that never moves")
-    print("  makes the NS look inert.  fc/certificates.py G7 measures it on the")
-    print("  real environment; the test double always reads 0 and means nothing.")
+        rows.append(dict(k_scale=float(k), ok=bool(ok), g4b=float(g4b),
+                         deliv_rec=float(rec), hurt=float(hurt), hurt_2se=float(h2se),
+                         ret0=r0["ret"], ret_priv=rp["ret"], **r))
+        print("  %-9.3f %-8.3f %-8.3f %-15s %-8.3f %-9.2f %-8.2f %s"
+              % (k, r["delta"], r["deliv"],
+                 "%.1f (-%.1f/%.1f)" % (r["ret"], hurt, h2se), g4b, rec,
+                 r["move_frac"], "OK" if ok else ", ".join(why)))
     good = [r for r in rows if r["ok"]]
     if good:
-        pick = min(good, key=lambda r: abs(r["delta"] - float(np.mean(TARGET_DELTA))))
-        print("  -> set ns_k_scale: %.3f in configs/envs_cfgs/smac.yaml and FREEZE it"
-              % pick["k_scale"])
+        pick = max(good, key=lambda r: r["k_scale"])     # the WEAKEST dial that works
+        print("  -> set ns_k_scale: %.3f (the weakest dial that clears G4b) and "
+              "FREEZE it" % pick["k_scale"])
     else:
-        print("  -> no row satisfies the constraints; widen the sweep before "
-              "touching anything else.")
+        best = max(rows, key=lambda r: r["g4b"])
+        print("  -> nothing clears G4b >= 1.30; best is k_scale=%.3f at %.3f."
+              % (best["k_scale"], best["g4b"]))
+        print("     Next lever is severity (--sweep severity), then this map is "
+              "not the one.")
     return rows
 
 
@@ -225,8 +275,10 @@ def sweep_max_trust(map_name, values, steps, mock, seed, ctl=None):
 
 
 SWEEPS = {
-    "k_scale": (sweep_k_scale, [0.15, 0.25, 0.35, 0.5, 0.7, 1.0]),
-    "severity": (sweep_severity, [0.0, 0.5, 1.0, 1.5, 2.0]),
+    # Reaches lower than before: on a map where the team is near its ceiling the
+    # dial has to be a good deal stronger before the return moves at all.
+    "k_scale": (sweep_k_scale, [0.08, 0.12, 0.18, 0.25, 0.35, 0.50]),
+    "severity": (sweep_severity, [0.0, 0.5, 1.0, 1.5, 2.0, 3.0]),
     "mu": (sweep_mu, [0.80, 0.88, 0.92, 0.95, 0.99, 0.9995]),
     "max_trust": (sweep_max_trust, [0.0, 0.25, 0.5, 0.75, 1.0]),
 }
@@ -235,7 +287,7 @@ SWEEPS = {
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--sweep", choices=sorted(SWEEPS), required=True)
-    ap.add_argument("--map", default="3s_vs_5z")
+    ap.add_argument("--map", default="1c3s5z")
     ap.add_argument("--controller", default="best",
                     choices=["best", "focus", "kite"])
     ap.add_argument("--steps", type=int, default=6000)
