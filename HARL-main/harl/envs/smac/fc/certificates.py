@@ -216,12 +216,19 @@ def _move(avail, dx, dy):
 
 
 def _focus(env, i, avail):
-    """Attack the weakest enemy in range, or None."""
+    """Attack the weakest enemy in range -- or, for a Medivac, HEAL the weakest
+    ally, because on the MMM maps SMAC re-points those same action slots at
+    allies.  Reading them as enemies would make the control target garbage on
+    exactly the maps whose operator is heterogeneous."""
     atk = np.where(np.asarray(avail[N_ACTIONS_NO_ATTACK:]) > 0)[0]
     if not atk.size:
         return None
-    hp = [(env.enemies[e].health + env.enemies[e].shield, e) for e in atk
-          if e in env.enemies]
+    heal = (getattr(env, "map_type", "") == "MMM"
+            and getattr(env, "medivac_id", 0)
+            and (env.agents.get(i) is not None)
+            and env.agents[i].unit_type == env.medivac_id)
+    pool = env.agents if heal else env.enemies
+    hp = [(pool[e].health + pool[e].shield, e) for e in atk if e in pool]
     return N_ACTIONS_NO_ATTACK + int(min(hp)[1]) if hp else None
 
 
@@ -260,7 +267,18 @@ def kite_action(env, i, avail):
     u = (getattr(env, "agents", {}) or {}).get(i, None)
     if u is None or u.health <= 0:
         return 0 if avail[0] else 1
-    rng = opmod.UNIT_STATS[_names(env)[i]]["weapon_range"]
+    name = _names(env)[i]
+    rng = opmod.UNIT_STATS[name]["weapon_range"]
+    if name == "Medivac":
+        # a Medivac has no weapon: it heals and stays out of the line, which is
+        # movement skill of a different kind and is exactly what MMM2 rewards.
+        shot = _focus(env, i, avail)
+        e, d = _nearest_enemy(env, u)
+        if e is not None and d < 5.0:
+            a = _move(avail, u.pos.x - e.pos.x, u.pos.y - e.pos.y)
+            if a is not None:
+                return a
+        return shot if shot is not None else (1 if avail[1] else 0)
     shot = _focus(env, i, avail)
     if rng <= 2.0:                                  # melee: closing IS the micro
         if shot is not None:
@@ -384,6 +402,48 @@ def _rollout(fc, controller, privileged=False, max_steps=100000, episodes=8,
     )
 
 
+CONTROLLERS = {}          # filled below, after both controllers are defined
+
+
+def pick_controller(map_name, seed=0, episodes=10, which="best", extra=None):
+    """Choose the REFERENCE controller by MEASURING it, never by assuming it.
+
+    D.1: *"The reference controller must include whatever the environment's own
+    built-in heuristics do.  A strawman reference makes every gate pass for the
+    wrong reason."*  On this environment it failed the other way -- a reference
+    with no movement skill made G4b FAIL for the wrong reason, because degrading a
+    harmful behaviour is not a harm.  Measured: on 3s_vs_5z the focus-fire control
+    returned 3.64 and a kiting one 11.13, so every gate read against the former
+    was reading a strawman; on 3s5z the ranking reverses (13.21 vs 10.91) because
+    five melee zealots have nothing to kite with.
+
+    So the reference is whichever available control scores higher at sigma = 0 on
+    THIS map, chosen before the dial is ever switched on, and the choice is
+    reported with both numbers.  ``which`` forces one instead, for an ablation.
+    """
+    if which in CONTROLLERS:
+        return which, CONTROLLERS[which], {}
+    table = {}
+    for name, fn in CONTROLLERS.items():
+        fc = _make(map_name, 0.0, seed, extra)
+        r = _rollout(fc, fn, False, episodes=episodes)
+        fc.close()
+        table[name] = dict(ret=r["ret"], se=r["ret_se"], move_frac=r["move_frac"])
+    best = max(table, key=lambda k: table[k]["ret"])
+    print("  reference control chosen at sigma=0 on %s: %s  (%s)"
+          % (map_name, best, ", ".join("%s %.2f+-%.2f" % (k, v["ret"], v["se"])
+                                       for k, v in sorted(table.items()))))
+    if len(table) > 1:
+        lo = min(table, key=lambda k: table[k]["ret"])
+        print("  movement headroom = %.2fx -- %s"
+              % (table[best]["ret"] / max(1e-9, table[lo]["ret"]),
+                 "movement skill is worth real return here"
+                 if table[best]["ret"] > 1.15 * table[lo]["ret"]
+                 else "movement buys little on this map; a stride channel will "
+                      "struggle to transmit"))
+    return best, CONTROLLERS[best], table
+
+
 def _make(map_name, sigma, seed, extra=None):
     from ..StarCraft2_Env import StarCraft2Env
     args = {"map_name": map_name, "state_type": "FP"}
@@ -394,15 +454,21 @@ def _make(map_name, sigma, seed, extra=None):
     return FormationCongestionEnv(env, a)
 
 
-def live_gates(map_name="3s5z", sigmas=(0.0, 0.5, 1.0, 1.5), episodes=8, seed=0):
+CONTROLLERS.update(focus=reference_action, kite=kite_action)
+
+
+def live_gates(map_name="3s5z", sigmas=(0.0, 0.5, 1.0, 1.5), episodes=8, seed=0,
+               controller="best"):
     """G0, G0b, G3, G4a, G4b, G5, G6, G7 plus the sigma=1 anchor measurement."""
+    cname, ctl, ctable = pick_controller(map_name, seed, max(6, episodes // 2),
+                                         controller)
     rows = {}
     for s in sigmas:
         fc = _make(map_name, s, seed)
-        ref = _rollout(fc, reference_action, False, episodes=episodes)
+        ref = _rollout(fc, ctl, False, episodes=episodes)
         fc.close()
         fc = _make(map_name, s, seed)
-        priv = _rollout(fc, reference_action, True, episodes=episodes)
+        priv = _rollout(fc, ctl, True, episodes=episodes)
         fc.close()
         rows[float(s)] = dict(ref=ref, priv=priv)
         print("[sigma=%.2f] ref ret=%.1f+-%.1f win=%.2f len=%.0f | priv ret=%.1f+-%.1f "
@@ -464,6 +530,15 @@ def live_gates(map_name="3s5z", sigmas=(0.0, 0.5, 1.0, 1.5), episodes=8, seed=0)
          np.isfinite(top["ref"]["odom_err"]),
          "odometric reconstruction error = %.4f (the sensor is physical)"
          % top["ref"]["odom_err"])
+    lost = base["ref"]["deliv"] - ref1["ref"]["deliv"]
+    rec = ((ref1["priv"]["deliv"] - ref1["ref"]["deliv"]) / lost
+           if lost > 1e-6 else float("nan"))
+    gate("the ORACLE restores the delivery it is meant to",
+         np.isfinite(rec) and rec > 0.8,
+         "deliv %.3f -> %.3f of a sigma=0 %.3f  (recovery %.2f).  Near 1.0 with a "
+         "flat G4b means the compensator WORKS and the return does not follow -- "
+         "an environment fact, not a method fact."
+         % (ref1["ref"]["deliv"], ref1["priv"]["deliv"], base["ref"]["deliv"], rec))
     gate("temporal split: peer anticipation has room",
          np.isfinite(ref1["ref"]["residual_share"])
          and ref1["ref"]["residual_share"] > 0.02,
@@ -676,6 +751,9 @@ def main(argv=None):
                     help="comma-separated maps to rank by G4b; bare --scan uses "
                          "the built-in candidate list")
     ap.add_argument("--sigma", type=float, default=1.0)
+    ap.add_argument("--controller", default="best", choices=["best", "focus", "kite"],
+                    help="reference control: 'best' MEASURES both at sigma=0 on "
+                         "this map and takes the stronger (D.1)")
     ap.add_argument("--episodes", type=int, default=20)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--k_scale", type=float, default=0.35)
@@ -732,13 +810,15 @@ def main(argv=None):
     print("  the source split, so read the TEMPORAL split from the live gates too:")
     print("  it is the stale local sensor, not the source, that bounds a local fix.")
 
-    result = dict(map=args.map, ceiling=rows, dial=d)
+    result = dict(map=args.map, ceiling=rows, dial=d,
+                  controller=args.controller)
     if not args.offline:
         print()
         print("=" * 74)
         print("LIVE gates -- StarCraft II required")
         print("=" * 74)
-        ok, gates, raw = live_gates(args.map, episodes=args.episodes, seed=args.seed)
+        ok, gates, raw = live_gates(args.map, episodes=args.episodes,
+                                    seed=args.seed, controller=args.controller)
         pl = placebo_gate(args.map, seed=args.seed)
         result["gates"] = gates
         result["placebo"] = bool(pl)

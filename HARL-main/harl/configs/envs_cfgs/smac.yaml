@@ -1,4 +1,21 @@
-map_name: 3s5z
+map_name: 3s_vs_5z
+# 3s_vs_5z, not 3s5z, and the reason is MEASURED (fc/certificates.py --headroom):
+#   map          focus-fire s=0   kiting s=0   movement headroom
+#   3s_vs_5z          3.64          11.13          3.06x     <- movement IS the task
+#   3s5z             13.21          10.91          0.83x     <- a stand-and-shoot slug
+# The harm channel is a stride throttle, so it can only transmit to reward where
+# movement decides something.  On 3s5z a PERFECT oracle on the true deficit gained
+# 1.029; on 3s_vs_5z with a control that actually uses movement it gains 1.258 and
+# recovers 73% of what the dial costs.
+#
+# *** OPEN, AND IT MATTERS: 3s_vs_5z's ally squad is 3 Stalkers, so the declared
+# operator is UNIFORM there -- spread 0.000, asymmetry 0.000.  It is still the
+# true operator (a homogeneous squad really has no structure), but the "declared
+# operator beats a geometric proxy" ABLATION cannot be run on it, because a proxy
+# would reproduce it exactly.  The maps with a real operator are 2s3z (spread
+# 1.073), 1c3s5z (0.992, asym 0.333) and 3s5z (0.957) -- none of which has been
+# headroom-tested except 3s5z, which failed it.  Settle that before committing:
+#     python -m harl.envs.smac.fc.certificates --headroom 1c3s5z,2s3z,MMM2 ***
 state_type: FP # choose from FP (Feature Pruned) and EP (Environment Provided)
 
 # ===========================================================================

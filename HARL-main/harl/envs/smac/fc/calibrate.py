@@ -34,10 +34,14 @@ import sys
 import numpy as np
 
 from . import operator as opmod
-from .certificates import reference_action
+from .certificates import pick_controller, reference_action
 from .pact_env import PactEnv
 from .severity_env import FormationCongestionEnv, N_ACTIONS_NO_ATTACK
 
+#: The reference control is CHOSEN BY MEASUREMENT, not assumed -- see
+#: certificates.pick_controller.  Measured on 3s_vs_5z: a focus-fire control
+#: returns 3.64 and a kiting one 11.13, so every sweep run against the former was
+#: calibrating against a strawman in exactly the dimension the channel acts on.
 #: Where a healthy dial should land.  These are the CALIBRATION CONSTRAINTS, and
 #: they come from the spec, not from what makes a method look good:
 #:   D.2 / G3  -- the blind team must be HURT (mean deficit is not ~0) ...
@@ -113,7 +117,7 @@ def _drive(top, fc, env, steps, seed=0, controller=None):
     return out
 
 
-def sweep_k_scale(map_name, values, steps, mock, seed):
+def sweep_k_scale(map_name, values, steps, mock, seed, ctl=None):
     print("k_scale sweep -- the medium's units.  Pick the row whose delta_mean is")
     print("inside %s AND whose move_frac and phi_var are healthy, then FREEZE it."
           % (TARGET_DELTA,))
@@ -124,7 +128,7 @@ def sweep_k_scale(map_name, values, steps, mock, seed):
     for k in values:
         top, fc, env = _build(map_name, {"ns_severity": 1.0, "ns_k_scale": float(k)},
                               mock, seed)
-        r = _drive(top, fc, env, steps, seed, reference_action)
+        r = _drive(top, fc, env, steps, seed, ctl or reference_action)
         env.close()
         why = []
         if r["delta"] < TARGET_DELTA[0]:
@@ -155,14 +159,14 @@ def sweep_k_scale(map_name, values, steps, mock, seed):
     return rows
 
 
-def sweep_severity(map_name, values, steps, mock, seed):
+def sweep_severity(map_name, values, steps, mock, seed, ctl=None):
     print("severity sweep -- gate G3 ('a dial that does not hurt is not a dial')")
     print("  %-8s %-11s %-11s %-10s %-9s %-9s %s"
           % ("sigma", "delta_mean", "dial_ratio", "stride", "ret", "ep_len", "peer_share"))
     rows = []
     for s in values:
         top, fc, env = _build(map_name, {"ns_severity": float(s)}, mock, seed)
-        r = _drive(top, fc, env, steps, seed, reference_action)
+        r = _drive(top, fc, env, steps, seed, ctl or reference_action)
         env.close()
         print("  %-8.2f %-11.4f %-11.3f %-10.3f %-9.2f %-9.1f %.3f"
               % (s, r["delta"], r["dial_ratio"], r["stride"], r["ret"],
@@ -171,7 +175,7 @@ def sweep_severity(map_name, values, steps, mock, seed):
     return rows
 
 
-def sweep_mu(map_name, values, steps, mock, seed):
+def sweep_mu(map_name, values, steps, mock, seed, ctl=None):
     print("mu sweep -- spec 5.1.  RE-MEASURE PER ENVIRONMENT: the optimum follows")
     print("the drift rate, and this driver moves in tens of steps, not days.")
     print("  %-9s %-11s %-11s %-10s %-9s %s"
@@ -181,7 +185,7 @@ def sweep_mu(map_name, values, steps, mock, seed):
         top, fc, env = _build(map_name,
                               {"ns_severity": 1.0, "pact": 1, "pact_mu": float(mu)},
                               mock, seed)
-        r = _drive(top, fc, env, steps, seed, reference_action)
+        r = _drive(top, fc, env, steps, seed, ctl or reference_action)
         env.close()
         share = r["ff"] / max(1e-12, r["ff"] + r["peer"])
         print("  %-9.4f %-11.4f %-11.4f %-10.3f %-9.3f %.2f"
@@ -195,7 +199,7 @@ def sweep_mu(map_name, values, steps, mock, seed):
     return rows
 
 
-def sweep_max_trust(map_name, values, steps, mock, seed):
+def sweep_max_trust(map_name, values, steps, mock, seed, ctl=None):
     print("max_trust sweep -- spec 8.4's T4 gain cap.")
     print("*** CALIBRATE ON ONE SEED AND VALIDATE ON HELD-OUT SEEDS.  Calibrating")
     print("*** and reporting on the same seed is fitting to the test set.")
@@ -207,7 +211,7 @@ def sweep_max_trust(map_name, values, steps, mock, seed):
         top, fc, env = _build(map_name,
                               {"ns_severity": 1.0, "pact": 1,
                                "pact_max_trust": float(g)}, mock, seed)
-        r = _drive(top, fc, env, steps, seed, reference_action)
+        r = _drive(top, fc, env, steps, seed, ctl or reference_action)
         env.close()
         if base is None:
             base = r["stride"]
@@ -231,7 +235,9 @@ SWEEPS = {
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--sweep", choices=sorted(SWEEPS), required=True)
-    ap.add_argument("--map", default="3s5z")
+    ap.add_argument("--map", default="3s_vs_5z")
+    ap.add_argument("--controller", default="best",
+                    choices=["best", "focus", "kite"])
     ap.add_argument("--steps", type=int, default=6000)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--values", default="", help="comma-separated override")
@@ -242,12 +248,18 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     fn, default_vals = SWEEPS[args.sweep]
+    # D.1, enforced rather than assumed: pick the stronger control on THIS map at
+    # sigma=0 before the dial is ever switched on.
+    if args.mock:
+        ctl = reference_action
+    else:
+        _, ctl, _ = pick_controller(args.map, args.seed, 8, args.controller)
     vals = ([float(v) for v in args.values.split(",")] if args.values
             else default_vals)
     if args.mock:
         print("*** --mock: these numbers are from a TEST DOUBLE and calibrate "
               "nothing.  Commit only numbers from a real StarCraft II run. ***")
-    rows = fn(args.map, vals, args.steps, args.mock, args.seed)
+    rows = fn(args.map, vals, args.steps, args.mock, args.seed, ctl)
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump(dict(sweep=args.sweep, map=args.map, seed=args.seed,
