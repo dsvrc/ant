@@ -82,25 +82,52 @@ def _pcr_eval_env_args(env_args, rank, n_threads):
     return ea, offset
 
 
-def _snd_dephase(env_args, rank, n_threads):
-    """Per-rank copy of ``env_args`` carrying this SMAC-CWO env's driver phase.
+def _fc_dephase(env_args, rank, n_threads):
+    """Per-rank copy of ``env_args`` carrying this SMAC env's driver phase.
 
-    The CWO driver A(t) is a raised cosine of period 5000 env steps -- ~30x a rollout
-    (episode_length=160) and ~40x an episode.  With every parallel env on the same
-    clock, a whole PPO batch sees ONE phase of the driver (the critic chases a moving
-    target) and, worse, a whole EVAL round is a single-phase snapshot: 40 episodes /
-    10 threads advances the eval clock by only ~4*ep_len ~= 250-600 of 5000 steps, so
-    consecutive evals crawl around the cycle and the reported win-rate becomes a slow
-    square wave measuring the driver phase rather than the policy.
+    The Formation-Congestion driver A(t) is a raised cosine over one episode
+    limit.  With every parallel env on the same clock a whole PPO batch sees ONE
+    phase of the driver (the critic chases a moving target) and, worse, a whole
+    EVAL round becomes a single-phase snapshot, so the reported win rate measures
+    the driver phase rather than the policy.  NS_FORM_SPEC E.2 pitfall 6:
+    "sampling only the mild end understates the dial -- spread across it."
 
     Spreading rank r to phase r/n_threads makes every batch and every eval round a
-    true cycle-average.  Same idea, same reason as ``_pcr_eval_env_args`` for
-    mamujoco; ``StarCraft2_Env`` reads ``snd_phase`` and ignores it when
-    ``SMAC_SND_DEPHASE=0``.  Copies the dict per rank -- never mutates the shared one.
+    true cycle-average.  Copies the dict per rank -- never mutates the shared one.
     """
     if n_threads <= 1:
         return env_args
-    return {**env_args, "snd_phase": float(rank) / float(n_threads)}
+    return {**env_args, "ns_phase": float(rank) / float(n_threads)}
+
+
+def make_smac_env(env_args, rank=0, n_threads=1, seed=None):
+    """Build a SMAC env with the Formation-Congestion stack.
+
+        StarCraft2Env                 stock, byte for byte
+          +-- FormationCongestionEnv  the NS dial   (env_args["fc"], default ON)
+                +-- PactEnv           the compensator (env_args["pact"], default OFF)
+
+    NS_FORM_SPEC B.5: the dial sits BELOW the method, so MAPPO, HAPPO and every
+    other baseline run inside exactly the same physics as PACT and a dial only the
+    method experienced is impossible by construction.  ``fc: 0`` gives plain stock
+    SMAC for a B0 reference run.
+    """
+    from harl.envs.smac.StarCraft2_Env import StarCraft2Env
+
+    a = _fc_dephase(env_args, rank, n_threads)
+    env = StarCraft2Env(a)
+    if seed is not None:
+        env.seed(seed)
+    if not int(a.get("fc", 1)):
+        return env
+    from harl.envs.smac.fc.severity_env import FormationCongestionEnv
+
+    env = FormationCongestionEnv(env, {**a, "ns_seed": int(a.get("ns_seed", rank))})
+    if int(a.get("pact", 0)):
+        from harl.envs.smac.fc.pact_env import PactEnv
+
+        env = PactEnv(env, a)
+    return env
 
 
 def make_train_env(env_name, seed, n_threads, env_args):
@@ -113,9 +140,7 @@ def make_train_env(env_name, seed, n_threads, env_args):
     def get_env_fn(rank):
         def init_env():
             if env_name == "smac":
-                from harl.envs.smac.StarCraft2_Env import StarCraft2Env
-
-                env = StarCraft2Env(_snd_dephase(env_args, rank, n_threads))
+                env = make_smac_env(env_args, rank, n_threads)
             elif env_name == "smacv2":
                 from harl.envs.smacv2.smacv2_env import SMACv2Env
 
@@ -206,17 +231,15 @@ def make_eval_env(env_name, seed, n_threads, env_args):
     if env_name == "dexhands":  # dexhands does not support running multiple instances
         raise NotImplementedError
 
-    # SMAC-CWO: eval envs SKIP the training warmup curriculum -- they always use the
-    # full severity so eval measures the harmed win rate.  Harmless for other envs
-    # (only StarCraft2_Env reads "snd_eval").
-    env_args = {**env_args, "snd_eval": 1}
+    # Eval envs SKIP any training severity curriculum -- they always run the full
+    # severity, so evaluation measures the harmed task rather than the warmup.
+    # Harmless for other envs (only the SMAC severity wrapper reads "ns_eval").
+    env_args = {**env_args, "ns_eval": 1}
 
     def get_env_fn(rank):
         def init_env():
             if env_name == "smac":
-                from harl.envs.smac.StarCraft2_Env import StarCraft2Env
-
-                env = StarCraft2Env(_snd_dephase(env_args, rank, n_threads))
+                env = make_smac_env(env_args, rank, n_threads)
             elif env_name == "smacv2":
                 from harl.envs.smacv2.smacv2_env import SMACv2Env
 
@@ -337,9 +360,7 @@ def make_render_env(env_name, seed, env_args):
     manual_delay = True  # manually delay the rendering by time.sleep()
     env_num = 1  # number of parallel envs
     if env_name == "smac":
-        from harl.envs.smac.StarCraft2_Env import StarCraft2Env
-
-        env = StarCraft2Env(args=env_args)
+        env = make_smac_env(env_args, 0, 1, seed=seed * 60000)
         manual_render = (
             False  # smac does not support manually calling the render() function
         )

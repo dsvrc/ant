@@ -19,7 +19,7 @@ class SMACLogger(BaseLogger):
         self.episodes = episodes
         self.episode_lens = []
         self.one_episode_len = np.zeros(
-            self.algo_args["train"]["n_rollout_threads"], dtype=np.int
+            self.algo_args["train"]["n_rollout_threads"], dtype=int
         )
         self.last_battles_game = np.zeros(
             self.algo_args["train"]["n_rollout_threads"], dtype=np.float32
@@ -139,11 +139,12 @@ class SMACLogger(BaseLogger):
     def eval_init(self):
         super().eval_init()
         self.eval_battles_won = 0
-        # CWO: the driver value A(t) each finished eval episode ended on.  Under the
-        # de-phased eval envs the round covers the whole cycle, so splitting the wins
-        # by phase turns one aggregate number into the two that actually matter --
-        # can the policy still win when the bus is HOT (peak), and does it keep the
-        # stationary win-rate when it is COLD (trough)?
+        # Formation Congestion: the driver value A(t) each finished eval episode
+        # ended on.  Under the de-phased eval envs the round covers the whole cycle,
+        # so splitting the wins by phase turns one aggregate number into the two
+        # that actually matter -- can the policy still win when the frontage is
+        # SQUEEZED (peak), and does it keep the stationary win rate inside the
+        # PLACEBO regime (trough), where the dial provably does nothing?
         self.eval_A = []
         self.eval_won_flags = []
 
@@ -152,17 +153,18 @@ class SMACLogger(BaseLogger):
         won = self.eval_infos[tid][0][self.win_key] == True
         if won:
             self.eval_battles_won += 1
-        A = self.eval_infos[tid][0].get("cwo_A", None)
+        A = self.eval_infos[tid][0].get(
+            "fc_A", self.eval_infos[tid][0].get("cwo_A", None))
         if A is not None:
             self.eval_A.append(float(A))
             self.eval_won_flags.append(1.0 if won else 0.0)
 
     def _phase_split(self):
-        """(peak, trough, coverage) win rates over this eval round, or None if the
-        env is not the CWO one.  `coverage` is the fraction of the driver cycle the
-        round actually sampled -- if it is small the aggregate win-rate is a
-        single-phase SNAPSHOT and must not be compared across evals (that is the
-        aliasing `_snd_dephase` exists to remove; see envs_tools)."""
+        """(peak, trough, coverage) win rates over this eval round, or None when
+        the env publishes no driver.  `coverage` is the fraction of the driver
+        cycle the round actually sampled -- if it is small the aggregate win rate
+        is a single-phase SNAPSHOT and must not be compared across evals (that is
+        the aliasing `_fc_dephase` exists to remove; see envs_tools)."""
         if not self.eval_A:
             return None
         A = np.asarray(self.eval_A, dtype=np.float64)

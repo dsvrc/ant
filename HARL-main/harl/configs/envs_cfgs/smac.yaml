@@ -1,2 +1,90 @@
-map_name: 2s_vs_1sc
+map_name: 3s5z
 state_type: FP # choose from FP (Feature Pruned) and EP (Environment Provided)
+
+# ===========================================================================
+# Formation Congestion -- the non-stationarity.  TASK PHYSICS, NOT A METHOD KNOB.
+# ---------------------------------------------------------------------------
+# NS_FORM_SPEC B.5: the dial lives here, in the ENV config, so every arm --
+# MAPPO, HAPPO, PACT, anything -- runs inside identical physics.  A dial only the
+# method's arm experienced would be worthless as evidence.
+#
+# Story: StarCraft II ground units are rigid collision bodies that block each
+# other.  A unit's medium is the ground it has to move through; the more of the
+# squad is alive and engaging around it, the less of its ordered step it actually
+# takes.  The enemy line's push/consolidate cycle squeezes the squad's usable
+# frontage, so the capacity of that medium shrinks and shrinks on a cycle.
+#
+#   u_i    = L_i / K_i ,   L_i^m = sum_j W[i,j] prox_ij cone_ij^m Phi_j + L^fix
+#   K_i(t) = K_i^0 * g(sigma, A(t))                     <- the driver, capacity only
+#   Delta_i = u_i * (1 - g)                             <- the delivery deficit
+#   delivered_i = base_i * cmd_i * (1 - Delta_i)        <- multiplicative, invertible
+#
+# At sigma = 0, g == 1 and Delta == 0 identically: stock SMAC, byte for byte.
+# At N = 1 the peer sum is empty, so the cross-agent term is exactly 0 however
+# small g becomes -- category C, structurally.
+# ===========================================================================
+fc: 1                 # 0 = plain stock SMAC (use for a B0 reference run)
+ns_severity: 1.0      # THE ONE KNOB.  0 = stock.  >1 is a beyond-physical stress
+                      # test and must be labelled as such in every table.
+ns_period: ~          # driver period in env steps; ~ = one cycle per episode limit
+ns_knee: 0.35         # A(t) <= knee is the PLACEBO REGIME: g == 1 exactly at every
+                      # severity, so ~35% of every cycle is provably inert (B.4)
+ns_depth: 0.60        # capacity shrink at sigma=1, A=1.  The sigma=1 anchor;
+                      # fc/certificates.py measures the game's own congestion
+ns_floor: 0.25        # g never drops below this
+ns_harm_max: 0.75     # Delta cap -- a unit is never fully immobilised
+ns_k_scale: 0.35      # the medium's units.  Declared; frozen by fc/calibrate.py
+                      # BEFORE any method runs, and identical for every arm
+ns_phi_fire: 1.0      # Phi_j = alive_j * (1 + phi_fire * fired_j).  alive is the
+                      # UNCANCELLABLE floor (A.5); firing is what makes it vary
+ns_phi_rho: 0.6       # obstruction has inertia -- ~3-step memory.  This is what
+                      # makes PACT's one-step peer persistence sound (spec 4.2)
+ns_phi_move: 0.0      # >0 makes Phi read the EXECUTED stride => LOOP-COUPLED
+                      # (A.6) and T4 applies.  0 = the loop-free contrast case,
+                      # which is what the spec's E-table PREDICTS for SMAC
+ns_prox_len: 2.0      # obstruction decay length (world units)
+ns_band_scale: 2.0    # how fast obstruction falls off with a weapon-range gap
+ns_reach_clip: 1      # clip the base move order to the unit's own one-step reach
+                      # (removes the dead zone; changes no displacement).  0 = raw
+ns_sensor_noise: 0.0  # declared sensor noise, drawn from its own generator
+ns_mean_preserving: 0 # D.2 option 2: normalise g by its cycle mean so only the
+                      # SHAPE varies.  Satisfies G4a at the cost of B.1.3 (g then
+                      # exceeds 1 somewhere), so it is off and reported when on
+ns_warmup: 0          # curriculum, in env steps.  OFF ON PURPOSE: at severity 0
+ns_ramp: 0            # the compensator is provably inert, so an arm comparison
+                      # inside a warmup window measures basin luck, not method
+
+# ===========================================================================
+# PACT -- the compensator.  Switched on by `--algo pact`; these are its knobs.
+# ===========================================================================
+pact: 0               # DO NOT EDIT: the algo name is the authority.  `--algo pact`
+                      # and `--algo pact_mappo` set it to 1; every other algo gets
+                      # the DIAL and not the method, which is the point of B.5.
+pact_r: 1             # channels.  DEFAULT 1: spec 2.2 measured r=2 WORSE
+                      # conditioned (3006 vs 810), and selfcheck T2 reproduces it
+pact_mu: ~            # RLS forgetting.  ~ = derived from the driver period
+                      # (memory ~ period/12); spec 5.1 says MEASURE it per
+                      # environment, and fc/calibrate.py --sweep mu does
+pact_p0: 1.0
+pact_p_max_mult: 10.0 # covariance windup bound: p_max = mult * p0 * dim (5.2)
+pact_max_trust: 1.0   # the T4 gain cap.  A PHASE-1 CALIBRATION PARAMETER: sweep
+                      # it, report the sweep, calibrate on one seed and VALIDATE
+                      # on held-out seeds (8.4).  0 = feedforward-only arm
+pact_ff_gain: 1.0     # the analytic driver feedforward (spec 7).  It is LOCAL and
+                      # supports no coordination claim, so ff_gain=0 is the arm
+                      # that isolates coordination and ff/peer is always reported
+pact_fit_floor: 0.0   # gate on MEASURED lift over the null, never on a covariance
+pact_ready_updates: 200
+pact_fit_lam: 0.999   # windowed, not cumulative -- a cumulative fit_gain is held
+pact_fit_warmup: 200  # down forever by early negatives (8.2)
+pact_peer_mode: delta # "delta" = the peer term carries the predicted one-step
+                      # CHANGE, so it cannot double-count the feedforward.
+                      # "ema" = spec 6.4 literally, with pact_level_tau
+pact_level_tau: ~
+pact_max_delta: 3.0
+pact_cmd_min: 0.25
+pact_cmd_max: 4.0
+pact_u_active: 0.05   # below this the driver is inert and u is unrecoverable from
+                      # Delta; skipped rather than epsilon-floored (spec 9)
+pact_directional: 0   # Kulhavy directional forgetting, as an ablation against the
+                      # plain-forgetting + trace-bound recipe of 5.1/5.2

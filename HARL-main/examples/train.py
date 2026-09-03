@@ -45,9 +45,12 @@ def main():
             "recon",
             "omax",
             "pact",
+            "pact_mappo",
+            "happo_fc",
+            "mappo_fc",
             "hasac_diag",
         ],
-        help="Algorithm name. Choose from: happo, hatrpo, haa2c, haddpg, hatd3, hasac, had3qn, maddpg, matd3, mappo, corep, lcpo, fsac, trio, escp, oracle, ernie, doraemon, advantage_alignment, mbcd, wisdom, mamt, drive, comarl, echor, echor_hasac, ecl, ecl_happo, recon, omax, pact, hasac_diag.",
+        help="Algorithm name. Choose from: happo, hatrpo, haa2c, haddpg, hatd3, hasac, had3qn, maddpg, matd3, mappo, corep, lcpo, fsac, trio, escp, oracle, ernie, doraemon, advantage_alignment, mbcd, wisdom, mamt, drive, comarl, echor, echor_hasac, ecl, ecl_happo, recon, omax, pact, pact_mappo, happo_fc, mappo_fc, hasac_diag.",
     )
     parser.add_argument(
         "--env",

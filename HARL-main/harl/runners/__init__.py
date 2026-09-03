@@ -25,14 +25,26 @@ from harl.runners.on_policy_recon_runner import OnPolicyReconRunner
 from harl.runners.on_policy_omax_runner import OnPolicyOmaxRunner
 from harl.runners.on_policy_pact_runner import OnPolicyPactRunner
 from harl.runners.on_policy_pact_smac_runner import OnPolicyPactSmacRunner
+from harl.runners.on_policy_pact_fc_runner import (
+    OnPolicyFcBlindHappoRunner,
+    OnPolicyFcBlindRunner,
+    OnPolicyPactFcHappoRunner,
+    OnPolicyPactFcRunner,
+)
 
 
 def _pact_runner(args, algo_args, env_args):
-    """`--algo pact` dispatches by env: the MAMuJoCo runner (continuous, learned
-    beta, reward decomposition) for mamujoco, the SMAC runner (discrete soft
-    variant, cosine-gate logging only) for smac/smacv2.  Both subclass the HAPPO
-    runner and train bit-identically; only the diagnostics differ."""
-    if args["env"] in ("smac", "smacv2"):
+    """`--algo pact` dispatches by env.  All three subclass a stock HAPPO runner
+    and train bit-identically; only the diagnostics differ.
+
+      smac     -> Formation Congestion + the compensator (harl/envs/smac/fc/),
+                  writing fc_debug.csv.
+      smacv2   -> the legacy coupled-weapon-overheat runner.
+      mamujoco -> the continuous PACT runner.
+    """
+    if args["env"] == "smac":
+        return OnPolicyPactFcHappoRunner(args, algo_args, env_args)
+    if args["env"] == "smacv2":
         return OnPolicyPactSmacRunner(args, algo_args, env_args)
     return OnPolicyPactRunner(args, algo_args, env_args)
 
@@ -84,9 +96,13 @@ RUNNER_REGISTRY = {
     # compares the PREDICTED load d_hat against the true pcr_d_next, which is a
     # stricter and more directly meaningful check than the old x2 waveform cosine.
     "pact_1": _pact_runner,
-    # SMAC PACT-1: same dispatch -> OnPolicyPactSmacRunner (env is smac), which now
-    # also logs the p1_* estimator columns.
-    "smac_pact_1": _pact_runner,
+    # PACT on Formation Congestion.  `pact` = HAPPO host, `pact_mappo` = MAPPO
+    # host; `happo_fc` / `mappo_fc` are the matching BLIND baselines, which train
+    # bit-identically to happo / mappo and only add the fc_debug.csv telemetry --
+    # so an inert dial is visible in the arm that would otherwise report nothing.
+    "pact_mappo": OnPolicyPactFcRunner,
+    "happo_fc": OnPolicyFcBlindHappoRunner,
+    "mappo_fc": OnPolicyFcBlindRunner,
     # PCR diagnosis campaign: HASAC + read-only, RNG-transparent telemetry.
     # Not a method — with telemetry off it IS hasac, and with it on the training
     # trajectory is still bit-identical (see OffPolicyDiagRunner._rng_frozen).

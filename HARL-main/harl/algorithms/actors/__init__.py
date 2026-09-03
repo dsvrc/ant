@@ -72,12 +72,14 @@ ALGO_REGISTRY = {
     # extra bounded action dim). Still stock HAPPO -- nothing about the learner
     # changes, so every arm shares host hyperparameters.
     "pact_1": HAPPO,
-    # SMAC PACT-1: same idea on the discrete channel. The interference split across
-    # the same-type / cross-type fire-control channels is unknown and drifting; each
-    # unit tracks it from where its OWN shots actually land, and the env applies the
-    # exact permutation inverse (a target pre-shift) at the estimator's confidence.
-    # Still stock HAPPO -- everything is env-side.
-    "smac_pact_1": HAPPO,
+    # PACT on Formation Congestion (SMAC).  The host is STOCK: `pact` is HAPPO and
+    # `pact_mappo` is MAPPO, and `happo_fc` / `mappo_fc` are the matching blind
+    # baselines running the identical actor on the identical obs/action spaces.
+    # The whole method is in harl/envs/smac/fc/, so an arm difference cannot be an
+    # algorithm difference (PACT_PIPELINE_SPEC 1).
+    "pact_mappo": MAPPO,
+    "happo_fc": HAPPO,
+    "mappo_fc": MAPPO,
     # PCR diagnosis campaign: the host policy/critic are HASAC's, untouched
     # (Prohibition 2 — host hyperparameters identical across every arm). The
     # telemetry lives entirely in OffPolicyDiagRunner.
