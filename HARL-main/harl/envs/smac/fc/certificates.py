@@ -194,6 +194,94 @@ def _enemy_centroid(env):
     return np.mean(pts, axis=0) if pts else None
 
 
+_NAME_CACHE = {}
+
+
+def _names(env):
+    key = (getattr(env, "map_name", "?"), int(env.n_agents))
+    if key not in _NAME_CACHE:
+        _NAME_CACHE[key] = opmod.composition(
+            key[0], key[1], getattr(env, "map_type", "stalkers_and_zealots"))
+    return _NAME_CACHE[key]
+
+
+def _move(avail, dx, dy):
+    """The available move action that best follows (dx, dy), or None."""
+    order = ([2 if dy > 0 else 3, 4 if dx > 0 else 5] if abs(dy) >= abs(dx)
+             else [4 if dx > 0 else 5, 2 if dy > 0 else 3])
+    for a in order:
+        if avail[a]:
+            return a
+    return None
+
+
+def _focus(env, i, avail):
+    """Attack the weakest enemy in range, or None."""
+    atk = np.where(np.asarray(avail[N_ACTIONS_NO_ATTACK:]) > 0)[0]
+    if not atk.size:
+        return None
+    hp = [(env.enemies[e].health + env.enemies[e].shield, e) for e in atk
+          if e in env.enemies]
+    return N_ACTIONS_NO_ATTACK + int(min(hp)[1]) if hp else None
+
+
+def _nearest_enemy(env, u):
+    best, bd = None, 1e9
+    for e in (getattr(env, "enemies", {}) or {}).values():
+        if e.health <= 0:
+            continue
+        d = float(np.hypot(e.pos.x - u.pos.x, e.pos.y - u.pos.y))
+        if d < bd:
+            best, bd = e, d
+    return best, bd
+
+
+def kite_action(env, i, avail):
+    """A movement-COMPETENT controller: retreat on cooldown, fire when ready.
+
+    D.1 exists because *"controls must be strong or the gates are meaningless"*,
+    and POWER's first privileged controller was purely reactive and LOST to
+    do-nothing (242 vs 316), making G4 unpassable for reasons that had nothing to
+    do with the dial.  ``reference_action`` is strong at FIRE CONTROL and has no
+    movement skill at all -- it walks straight at the enemy whenever nothing is in
+    range -- so a channel that degrades movement fidelity cannot be measured
+    against it: degrading a harmful behaviour is not a harm.  The scan showed that
+    directly on 2c_vs_64zg, where the dial IMPROVED the reference by 1.73 (2se
+    0.86).
+
+    This controller does the real SMAC micro instead: a ranged unit backs off
+    while its weapon is on cooldown and closes to fire when it is ready, so its
+    movement is worth return.  Melee units have nothing to kite with and simply
+    close.  Whether this beats ``reference_action`` at sigma=0 is the HEADROOM
+    measurement -- if movement buys nothing even for a controller built to use it,
+    then no movement channel can matter on this environment and that is a fact
+    about SMAC, not about the method.
+    """
+    u = (getattr(env, "agents", {}) or {}).get(i, None)
+    if u is None or u.health <= 0:
+        return 0 if avail[0] else 1
+    rng = opmod.UNIT_STATS[_names(env)[i]]["weapon_range"]
+    shot = _focus(env, i, avail)
+    if rng <= 2.0:                                  # melee: closing IS the micro
+        if shot is not None:
+            return shot
+        c = _enemy_centroid(env)
+        a = None if c is None else _move(avail, c[0] - u.pos.x, c[1] - u.pos.y)
+        return a if a is not None else (1 if avail[1] else 0)
+    e, d = _nearest_enemy(env, u)
+    cd = float(getattr(u, "weapon_cooldown", 0.0) or 0.0)
+    if e is not None and cd > 0.0 and d < rng:
+        # on cooldown with something inside my range: back off, do not stand there
+        a = _move(avail, u.pos.x - e.pos.x, u.pos.y - e.pos.y)
+        if a is not None:
+            return a
+    if shot is not None:
+        return shot
+    c = _enemy_centroid(env)
+    a = None if c is None else _move(avail, c[0] - u.pos.x, c[1] - u.pos.y)
+    return a if a is not None else (1 if avail[1] else 0)
+
+
 def reference_action(env, i, avail):
     """The REFERENCE controller: focus fire when anything is in range, otherwise
     close on the enemy line.  Strong on purpose (D.1) -- it is what SMAC's own
@@ -224,6 +312,7 @@ def _rollout(fc, controller, privileged=False, max_steps=100000, episodes=8,
     """Run `episodes` episodes and return the measured facts the gates need."""
     ep_ret, ep_len, wins = [], [], 0
     early_u, early_delta, deltas, gs, eps_id, moves, acts = [], [], [], [], [], 0, 0
+    deliv = []          # stride / base_frac -- 1.0 == the sigma=0 delivery
     u_hat = np.zeros(fc.n_agents)
     for _ep in range(int(episodes)):
         fc.reset()
@@ -249,6 +338,13 @@ def _rollout(fc, controller, privileged=False, max_steps=100000, episodes=8,
             # PER AGENT (see temporal_split): a squad mean is far smoother than
             # anything the compensator ever sees.  Dead units contribute NaN, which
             # the split drops rather than lagging across a death.
+            live_m = fc._alive > 0
+            if live_m.any():
+                # THE measurement that separates "the compensator does not work"
+                # from "it works and the return does not care".  1.0 is the
+                # sigma=0 delivery; the blind arm sits at (1 - Delta).
+                deliv.append(float(np.mean((fc.stride / np.maximum(1e-12,
+                                                                  fc.base_frac))[live_m])))
             deltas.append(np.where(fc._alive > 0, fc.delta, np.nan))
             gs.append(gnow)
             eps_id.append(_ep)
@@ -284,6 +380,7 @@ def _rollout(fc, controller, privileged=False, max_steps=100000, episodes=8,
         # for a measurement: SMAC episode returns are heavy-tailed and 8 of them
         # will separate almost any two arms by chance.
         ret_se=float(np.std(ep_ret) / max(1.0, np.sqrt(len(ep_ret)))),
+        deliv=float(np.mean(deliv)) if deliv else float("nan"),
     )
 
 
@@ -426,9 +523,9 @@ def scan(maps, episodes=20, seed=0, sigma=1.0):
     """
     print("map scan at sigma=%.2f, %d episodes/arm -- G4b is the number that "
           "decides whether training is worth it" % (sigma, episodes))
-    print("  %-13s %-10s %-11s %-13s %-13s %-9s %s"
-          % ("map", "move_frac", "delta_mean", "ref ret", "priv ret", "G4b",
-             "local_r2"))
+    print("  %-13s %-10s %-8s %-13s %-13s %-8s %-8s %s"
+          % ("map", "move_frac", "delta", "ref ret", "priv ret", "G4b",
+             "deliv_rec", "local_r2"))
     rows = []
     for m in maps:
         try:
@@ -445,7 +542,14 @@ def scan(maps, episodes=20, seed=0, sigma=1.0):
             print("  %-13s SKIPPED (%s)" % (m, exc))
             continue
         g4b = priv["ret"] / max(1e-9, ref["ret"])
-        rows.append(dict(map=m, move_frac=ref["move_frac"],
+        # How much of the LOST DELIVERY the oracle actually gets back.  ~1.0 means
+        # the compensator does its job and the return simply does not follow; ~0
+        # means the compensator is broken and nothing downstream can be read.
+        lost = r0["deliv"] - ref["deliv"]
+        rec = (priv["deliv"] - ref["deliv"]) / lost if lost > 1e-6 else float("nan")
+        rows.append(dict(map=m, move_frac=ref["move_frac"], deliv_rec=float(rec),
+                         deliv0=r0["deliv"], deliv_ref=ref["deliv"],
+                         deliv_priv=priv["deliv"],
                          delta_mean=ref["delta_mean"], ret0=r0["ret"],
                          ref=ref["ret"], ref_se=ref["ret_se"], priv=priv["ret"],
                          priv_se=priv["ret_se"], g4b=float(g4b),
@@ -453,10 +557,10 @@ def scan(maps, episodes=20, seed=0, sigma=1.0):
                          residual=ref["residual_share"],
                          hurt=(r0["ret"] - ref["ret"]),
                          hurt_2se=2 * float(np.hypot(r0["ret_se"], ref["ret_se"]))))
-        print("  %-13s %-10.2f %-11.4f %-13s %-13s %-9.3f %.3f"
+        print("  %-13s %-10.2f %-8.3f %-13s %-13s %-8.3f %-8.2f %.3f"
               % (m, ref["move_frac"], ref["delta_mean"],
                  "%.1f+-%.1f" % (ref["ret"], ref["ret_se"]),
-                 "%.1f+-%.1f" % (priv["ret"], priv["ret_se"]), g4b,
+                 "%.1f+-%.1f" % (priv["ret"], priv["ret_se"]), g4b, rec,
                  ref["local_r2"]))
     if rows:
         best = max(rows, key=lambda r: r["g4b"])
@@ -470,9 +574,104 @@ def scan(maps, episodes=20, seed=0, sigma=1.0):
     return rows
 
 
+def headroom(maps, episodes=20, seed=0, sigma=1.0):
+    """Is MOVEMENT worth any return at all?  The measurement that decides whether
+    a movement channel can ever matter on this environment.
+
+    The map scan came back flat (G4b 0.976-1.040 over eight maps, three of them
+    BELOW 1.0), which admits two readings and they call for opposite actions:
+
+      H1  displacement fidelity does not affect SMAC return, so no stride channel
+          can matter and this is a fact about SMAC.
+      H2  the controls have no movement skill, so restoring their movement
+          fidelity restores nothing -- D.1's failure mode, and the scan's
+          2c_vs_64zg row (the dial IMPROVED the reference by 1.73, 2se 0.86) is
+          direct evidence of it: degrading a harmful behaviour is not a harm.
+
+    Three columns separate them, with no training:
+
+      headroom   ret(kite, s=0) / ret(focus, s=0)   -- is movement skill worth
+                 return?  If ~1.0, H1 holds and the channel is dead here.
+      kite hurt  ret(kite, s=0) -> ret(kite, s=1)   -- does the dial cost a
+                 controller that actually USES movement?
+      deliv_rec  how much of the lost delivery the oracle gets back -- ~1.0 means
+                 the compensator works and the return does not follow; ~0 means
+                 the compensator is broken and nothing downstream can be read.
+    """
+    print("headroom test at sigma=%.2f, %d episodes/arm" % (sigma, episodes))
+    print("  %-13s %-14s %-14s %-9s %-15s %-8s %s"
+          % ("map", "focus s=0", "kite s=0", "headroom", "kite s=0->1",
+             "G4b_kite", "deliv_rec"))
+    rows = []
+    for m in maps:
+        try:
+            fc = _make(m, 0.0, seed)
+            f0 = _rollout(fc, reference_action, False, episodes=episodes)
+            fc.close()
+            fc = _make(m, 0.0, seed)
+            k0 = _rollout(fc, kite_action, False, episodes=episodes)
+            fc.close()
+            fc = _make(m, sigma, seed)
+            k1 = _rollout(fc, kite_action, False, episodes=episodes)
+            fc.close()
+            fc = _make(m, sigma, seed)
+            kp = _rollout(fc, kite_action, True, episodes=episodes)
+            fc.close()
+        except Exception as exc:
+            print("  %-13s SKIPPED (%s)" % (m, exc))
+            continue
+        head = k0["ret"] / max(1e-9, f0["ret"])
+        hurt = k0["ret"] - k1["ret"]
+        hurt_2se = 2 * float(np.hypot(k0["ret_se"], k1["ret_se"]))
+        g4b = kp["ret"] / max(1e-9, k1["ret"])
+        lost = k0["deliv"] - k1["deliv"]
+        rec = (kp["deliv"] - k1["deliv"]) / lost if lost > 1e-6 else float("nan")
+        rows.append(dict(map=m, focus0=f0["ret"], focus0_se=f0["ret_se"],
+                         kite0=k0["ret"], kite0_se=k0["ret_se"],
+                         kite1=k1["ret"], kite1_se=k1["ret_se"],
+                         kite_priv=kp["ret"], kite_priv_se=kp["ret_se"],
+                         headroom=float(head), hurt=float(hurt),
+                         hurt_2se=float(hurt_2se), g4b_kite=float(g4b),
+                         deliv_rec=float(rec), deliv0=k0["deliv"],
+                         deliv1=k1["deliv"], deliv_priv=kp["deliv"],
+                         move_frac_kite=k1["move_frac"]))
+        print("  %-13s %-14s %-14s %-9.3f %-15s %-8.3f %.2f"
+              % (m, "%.1f+-%.1f" % (f0["ret"], f0["ret_se"]),
+                 "%.1f+-%.1f" % (k0["ret"], k0["ret_se"]), head,
+                 "%+.2f/%.2f" % (hurt, hurt_2se), g4b, rec))
+    if rows:
+        best_h = max(rows, key=lambda r: r["headroom"])
+        best_g = max(rows, key=lambda r: r["g4b_kite"])
+        print()
+        print("  best headroom : %s at %.3f  -- movement skill is worth %s"
+              % (best_h["map"], best_h["headroom"],
+                 "REAL return" if best_h["headroom"] > 1.15 else "essentially NOTHING"))
+        print("  best G4b_kite : %s at %.3f  (bar 1.30)"
+              % (best_g["map"], best_g["g4b_kite"]))
+        recs = [r["deliv_rec"] for r in rows if np.isfinite(r["deliv_rec"])]
+        if recs:
+            print("  delivery recovery by the oracle: %.2f mean -- %s"
+                  % (float(np.mean(recs)),
+                     "the compensator WORKS; the return does not follow"
+                     if np.mean(recs) > 0.5 else
+                     "the COMPENSATOR is not restoring delivery; fix that first"))
+        if best_h["headroom"] <= 1.15:
+            print()
+            print("  READ: movement skill buys no return here even for a controller")
+            print("  built to use it, so a stride-throttle channel cannot transmit to")
+            print("  reward on SMAC.  That is H1, it is a fact about the ENVIRONMENT,")
+            print("  and NS_FORM_SPEC E.1 step 1 says a blank row is an answer:")
+            print("  report it, or change the harm channel -- do not train.")
+    return rows
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--map", default="3s5z")
+    ap.add_argument("--headroom", nargs="?", const="3s_vs_5z,2c_vs_64zg,3s5z,10m_vs_11m",
+                    default=None,
+                    help="is movement worth return at all?  Runs a movement-competent "
+                         "controller against the focus-fire reference at sigma=0.")
     ap.add_argument("--scan", nargs="?", const=",".join(SCAN_MAPS), default=None,
                     help="comma-separated maps to rank by G4b; bare --scan uses "
                          "the built-in candidate list")
@@ -484,6 +683,17 @@ def main(argv=None):
                     help="skip everything that needs StarCraft II")
     ap.add_argument("--out", default="")
     args = ap.parse_args(argv)
+
+    if args.headroom:
+        maps = [m.strip() for m in args.headroom.split(",") if m.strip()]
+        rows = headroom(maps, episodes=args.episodes, seed=args.seed,
+                        sigma=args.sigma)
+        if args.out:
+            with open(args.out, "w", encoding="utf-8") as f:
+                json.dump(dict(headroom=rows, sigma=args.sigma,
+                               episodes=args.episodes), f, indent=2, default=float)
+            print("wrote %s" % args.out)
+        return 0
 
     if args.scan:
         maps = [m.strip() for m in args.scan.split(",") if m.strip()]
