@@ -138,7 +138,7 @@ def ceiling_sweep(map_name="3s5z", n_agents=8, n_enemies=8, step_mul=8,
     return rows
 
 
-def temporal_split(deltas, g_series, warmup=200):
+def temporal_split(deltas, g_series, episode_ids, warmup=200):
     """How much of the excess a purely LOCAL controller can already remove.
 
     C.1 splits the excess by WHO controls the source.  On this environment that
@@ -149,25 +149,40 @@ def temporal_split(deltas, g_series, warmup=200):
     already explain?  Whatever is left is the only thing peer anticipation can
     buy, and it is what ``fit_gain`` measures online.
 
+    *** MEASURE IT PER AGENT, NOT ON THE SQUAD MEAN. ***  Averaging Delta over the
+    live squad removes exactly the cross-agent variation the peer channels exist
+    to predict, so a squad-mean series is far smoother than anything PACT ever
+    sees and reports a local R^2 that is much too high.  ``deltas`` is therefore
+    (T, n) and every agent contributes its own lagged pair; pairs that straddle an
+    episode boundary or a death are dropped rather than lagged across them.
+
     Returns the local predictor's R^2 and the residual share.  Guarded with NaN.
     """
     d = np.asarray(deltas, dtype=float)
+    if d.ndim == 1:
+        d = d[:, None]
     g = np.asarray(g_series, dtype=float)
-    if d.size <= warmup + 2:
-        return dict(local_r2=float("nan"), residual_share=float("nan"), n=int(d.size))
+    ep = np.asarray(episode_ids)
+    if d.shape[0] <= warmup + 2:
+        return dict(local_r2=float("nan"), residual_share=float("nan"), n=0)
     y = d[warmup + 1:]
     prev = d[warmup:-1]
-    ratio = np.where((1.0 - g[warmup:-1]) > 1e-6,
-                     (1.0 - g[warmup + 1:]) / np.maximum(1e-12, 1.0 - g[warmup:-1]),
-                     np.nan)
+    same_ep = (ep[warmup + 1:] == ep[warmup:-1])[:, None]
+    gn, gp = 1.0 - g[warmup + 1:], 1.0 - g[warmup:-1]
+    # Guard the ratio with NaN, never an epsilon: inside the placebo regime the
+    # disturbance is genuinely 0 and the ratio is meaningless.
+    ratio = np.where(gp > 1e-6, gn / np.maximum(1e-12, gp), np.nan)[:, None]
     pred = np.where(np.isfinite(ratio), prev * ratio, prev)
-    sst = float(np.nanvar(y))
+    ok = same_ep & np.isfinite(y) & np.isfinite(pred)
+    yv, pv = y[ok], pred[ok]
+    if yv.size < 100:
+        return dict(local_r2=float("nan"), residual_share=float("nan"), n=int(yv.size))
+    sst = float(np.var(yv))
     if not np.isfinite(sst) or sst <= 0.0:
-        return dict(local_r2=float("nan"), residual_share=float("nan"), n=int(y.size))
-    sse = float(np.nanmean((y - pred) ** 2))
-    r2 = 1.0 - sse / sst
+        return dict(local_r2=float("nan"), residual_share=float("nan"), n=int(yv.size))
+    r2 = 1.0 - float(np.mean((yv - pv) ** 2)) / sst
     return dict(local_r2=float(r2), residual_share=float(max(0.0, 1.0 - r2)),
-                n=int(y.size))
+                n=int(yv.size))
 
 
 # --------------------------------------------------------------------------- #
@@ -208,9 +223,9 @@ def _rollout(fc, controller, privileged=False, max_steps=100000, episodes=8,
              warm_window=40):
     """Run `episodes` episodes and return the measured facts the gates need."""
     ep_ret, ep_len, wins = [], [], 0
-    early_u, early_delta, deltas, gs, moves, acts = [], [], [], [], 0, 0
+    early_u, early_delta, deltas, gs, eps_id, moves, acts = [], [], [], [], [], 0, 0
     u_hat = np.zeros(fc.n_agents)
-    for _ in range(int(episodes)):
+    for _ep in range(int(episodes)):
         fc.reset()
         done, ret, t = False, 0.0, 0
         while not done and t < max_steps:
@@ -231,9 +246,12 @@ def _rollout(fc, controller, privileged=False, max_steps=100000, episodes=8,
             gnow = float(fc.g)
             if gnow < 1.0:
                 u_hat = 0.7 * u_hat + 0.3 * (fc.delta / max(1e-9, 1.0 - gnow))
-            deltas.append(float(np.mean(fc.delta[fc._alive > 0]))
-                          if np.any(fc._alive > 0) else np.nan)
+            # PER AGENT (see temporal_split): a squad mean is far smoother than
+            # anything the compensator ever sees.  Dead units contribute NaN, which
+            # the split drops rather than lagging across a death.
+            deltas.append(np.where(fc._alive > 0, fc.delta, np.nan))
             gs.append(gnow)
+            eps_id.append(_ep)
             if t < warm_window:
                 # G0b: a FIXED EARLY WINDOW.  Whole-episode means have survivorship
                 # bias -- a run that dies early only averages its calm opening,
@@ -250,7 +268,7 @@ def _rollout(fc, controller, privileged=False, max_steps=100000, episodes=8,
             t += 1
         ep_ret.append(ret)
         ep_len.append(t)
-    ts = temporal_split(deltas, gs)
+    ts = temporal_split(np.asarray(deltas), gs, eps_id)
     return dict(
         ret=float(np.mean(ep_ret)), ret_sd=float(np.std(ep_ret)),
         ep_len=float(np.mean(ep_len)), win=float(wins) / max(1, episodes),
@@ -261,7 +279,11 @@ def _rollout(fc, controller, privileged=False, max_steps=100000, episodes=8,
         odom_err=float(fc.diagnostics()["fc_odom_err"]),
         phi_var=float(fc.exertion.variation()),
         local_r2=ts["local_r2"], residual_share=ts["residual_share"],
-        n_ep=int(episodes),
+        n_pairs=int(ts["n"]), n_ep=int(episodes),
+        # the return's own spread, so a gate read off 8 episodes cannot be mistaken
+        # for a measurement: SMAC episode returns are heavy-tailed and 8 of them
+        # will separate almost any two arms by chance.
+        ret_se=float(np.std(ep_ret) / max(1.0, np.sqrt(len(ep_ret)))),
     )
 
 
@@ -286,9 +308,10 @@ def live_gates(map_name="3s5z", sigmas=(0.0, 0.5, 1.0, 1.5), episodes=8, seed=0)
         priv = _rollout(fc, reference_action, True, episodes=episodes)
         fc.close()
         rows[float(s)] = dict(ref=ref, priv=priv)
-        print("[sigma=%.2f] ref ret=%.1f win=%.2f len=%.0f | priv ret=%.1f win=%.2f "
-              "| u_early=%.3f delta_early=%.3f move_frac=%.2f local_r2=%.3f"
-              % (s, ref["ret"], ref["win"], ref["ep_len"], priv["ret"], priv["win"],
+        print("[sigma=%.2f] ref ret=%.1f+-%.1f win=%.2f len=%.0f | priv ret=%.1f+-%.1f "
+              "win=%.2f | u_early=%.3f delta_early=%.3f move_frac=%.2f local_r2=%.3f"
+              % (s, ref["ret"], ref["ret_se"], ref["win"], ref["ep_len"],
+                 priv["ret"], priv["ret_se"], priv["win"],
                  ref["early_u"], ref["early_delta"], ref["move_frac"],
                  ref["local_r2"]))
 
@@ -309,23 +332,37 @@ def live_gates(map_name="3s5z", sigmas=(0.0, 0.5, 1.0, 1.5), episodes=8, seed=0)
                for a, b in zip(sorted(rows), sorted(rows)[1:]))
     gate("G0b monotone on a FIXED early window", mono,
          " -> ".join("%.3f" % rows[s]["ref"]["early_u"] for s in sorted(rows)))
-    gate("G3  it hurts (reference falls with sigma)",
-         top["ref"]["ret"] < base["ref"]["ret"],
-         "ret %.1f -> %.1f" % (base["ref"]["ret"], top["ref"]["ret"]))
+    drop = base["ref"]["ret"] - top["ref"]["ret"]
+    se = float(np.hypot(base["ref"]["ret_se"], top["ref"]["ret_se"]))
+    gate("G3  it hurts (reference falls with sigma)", drop > 2.0 * se,
+         "ret %.1f -> %.1f  (drop %.1f, 2se %.1f)%s"
+         % (base["ref"]["ret"], top["ref"]["ret"], drop, 2 * se,
+            "" if drop > 2 * se else "  <- INSIDE THE NOISE: raise --episodes"))
     g4a = top["priv"]["ret"] / max(1e-9, base["priv"]["ret"])
     gate("G4a capacity  priv(s)/priv(0) >= 0.95", g4a >= 0.95,
          "%.3f  (D.2: a capacity-reducing dial FAILS this -- report against the "
          "ceiling measured AT that sigma)" % g4a)
     ref1 = rows.get(1.0, top)
     g4b = ref1["priv"]["ret"] / max(1e-9, ref1["ref"]["ret"])
-    gate("G4b coordination priv/ref >= 1.30", g4b >= 1.30, "%.3f" % g4b)
+    g4b_se = float(np.hypot(ref1["priv"]["ret_se"], ref1["ref"]["ret_se"])
+                   / max(1e-9, ref1["ref"]["ret"]))
+    gate("G4b coordination priv/ref >= 1.30", g4b >= 1.30,
+         "%.3f +- %.3f  <- THE GATE THAT DECIDES WHETHER TO TRAIN AT ALL: a "
+         "PERFECT oracle on the true deficit gains this much, so no method can "
+         "gain more" % (g4b, g4b_se))
     gate("G5  coupling rises toward the limit",
          top["ref"]["early_u"] > base["ref"]["early_u"],
          "u_early %.3f -> %.3f" % (base["ref"]["early_u"], top["ref"]["early_u"]))
-    gate("G7  agents act on a majority of steps",
-         top["ref"]["move_frac"] > 0.0,
-         "move_frac = %.2f (SMAC has no scripted bypass: 1 step per decision)"
-         % top["ref"]["move_frac"])
+    # D.3, read literally.  The harm channel only reaches a unit that is MOVING,
+    # so move_frac is this environment's version of "are the agents actually
+    # acting?" -- and a controller that plants and shoots feels no dial at all.
+    # The bar is a majority; anything much below it means the NS is being measured
+    # on a small minority of decisions and G4b will fail for that reason alone.
+    gate("G7  the channel reaches a majority of decisions",
+         top["ref"]["move_frac"] >= 0.5,
+         "move_frac = %.2f -- the throttle only touches move orders, so at this "
+         "rate %.0f%% of decisions never feel the dial"
+         % (top["ref"]["move_frac"], 100 * (1 - top["ref"]["move_frac"])))
     gate("anchor  sigma=1 vs the game's own congestion",
          np.isfinite(top["ref"]["odom_err"]),
          "odometric reconstruction error = %.4f (the sensor is physical)"
@@ -363,16 +400,100 @@ def placebo_gate(map_name="3s5z", sigmas=(0.0, 0.5, 1.0, 2.0), steps=60, seed=0)
     return same
 
 
+#: Candidate maps for --scan, chosen on ONE criterion: how much of the outcome
+#: movement decides.  The harm channel is a stride throttle, so a map where the
+#: fight is a stand-and-shoot slugfest cannot transmit it to reward however large
+#: the dial is, and G4b will fail for that reason alone.
+#:   kiting maps      -- movement IS the task; a slowed unit dies
+#:   large formations -- many bodies over one medium, which is C.4's knob for
+#:                       widening the coordination gap (more agents, less local
+#:                       authority per agent)
+SCAN_MAPS = ["3s5z", "3s_vs_5z", "3s_vs_4z", "2c_vs_64zg", "27m_vs_30m",
+             "10m_vs_11m", "MMM2", "1c3s5z"]
+
+
+def scan(maps, episodes=20, seed=0, sigma=1.0):
+    """Pick the environment on the gates, not on the story (NS_FORM_SPEC C.3).
+
+    *"Use it to choose the environment, not to excuse the outcome.  If the PEER
+    column is small, that environment is a poor showcase for a coordination method
+    however good the method is.  Compute this FIRST, across candidate
+    environments, and lead with whichever has the largest coordination gap."*
+
+    G4b is the decisive column: it is what a PERFECT oracle on the true deficit
+    buys over the blind reference, so no method can beat it.  ``move_frac`` is the
+    explanation column -- the throttle only touches move orders.
+    """
+    print("map scan at sigma=%.2f, %d episodes/arm -- G4b is the number that "
+          "decides whether training is worth it" % (sigma, episodes))
+    print("  %-13s %-10s %-11s %-13s %-13s %-9s %s"
+          % ("map", "move_frac", "delta_mean", "ref ret", "priv ret", "G4b",
+             "local_r2"))
+    rows = []
+    for m in maps:
+        try:
+            fc0 = _make(m, 0.0, seed)
+            r0 = _rollout(fc0, reference_action, False, episodes=episodes)
+            fc0.close()
+            fc = _make(m, sigma, seed)
+            ref = _rollout(fc, reference_action, False, episodes=episodes)
+            fc.close()
+            fc = _make(m, sigma, seed)
+            priv = _rollout(fc, reference_action, True, episodes=episodes)
+            fc.close()
+        except Exception as exc:                       # a map that will not build
+            print("  %-13s SKIPPED (%s)" % (m, exc))
+            continue
+        g4b = priv["ret"] / max(1e-9, ref["ret"])
+        rows.append(dict(map=m, move_frac=ref["move_frac"],
+                         delta_mean=ref["delta_mean"], ret0=r0["ret"],
+                         ref=ref["ret"], ref_se=ref["ret_se"], priv=priv["ret"],
+                         priv_se=priv["ret_se"], g4b=float(g4b),
+                         local_r2=ref["local_r2"],
+                         residual=ref["residual_share"],
+                         hurt=(r0["ret"] - ref["ret"]),
+                         hurt_2se=2 * float(np.hypot(r0["ret_se"], ref["ret_se"]))))
+        print("  %-13s %-10.2f %-11.4f %-13s %-13s %-9.3f %.3f"
+              % (m, ref["move_frac"], ref["delta_mean"],
+                 "%.1f+-%.1f" % (ref["ret"], ref["ret_se"]),
+                 "%.1f+-%.1f" % (priv["ret"], priv["ret_se"]), g4b,
+                 ref["local_r2"]))
+    if rows:
+        best = max(rows, key=lambda r: r["g4b"])
+        print()
+        print("  best G4b: %s at %.3f%s" % (best["map"], best["g4b"],
+              "  -- CLEARS the 1.30 bar" if best["g4b"] >= 1.30
+              else "  -- still below the 1.30 bar"))
+        print("  G3 on that map: sigma=0 ret %.1f -> sigma=%.2f ret %.1f "
+              "(drop %.1f, 2se %.1f)"
+              % (best["ret0"], sigma, best["ref"], best["hurt"], best["hurt_2se"]))
+    return rows
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--map", default="3s5z")
-    ap.add_argument("--episodes", type=int, default=8)
+    ap.add_argument("--scan", nargs="?", const=",".join(SCAN_MAPS), default=None,
+                    help="comma-separated maps to rank by G4b; bare --scan uses "
+                         "the built-in candidate list")
+    ap.add_argument("--sigma", type=float, default=1.0)
+    ap.add_argument("--episodes", type=int, default=20)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--k_scale", type=float, default=0.35)
     ap.add_argument("--offline", action="store_true",
                     help="skip everything that needs StarCraft II")
     ap.add_argument("--out", default="")
     args = ap.parse_args(argv)
+
+    if args.scan:
+        maps = [m.strip() for m in args.scan.split(",") if m.strip()]
+        rows = scan(maps, episodes=args.episodes, seed=args.seed, sigma=args.sigma)
+        if args.out:
+            with open(args.out, "w", encoding="utf-8") as f:
+                json.dump(dict(scan=rows, sigma=args.sigma,
+                               episodes=args.episodes), f, indent=2, default=float)
+            print("wrote %s" % args.out)
+        return 0
 
     print("=" * 74)
     print("OFFLINE certificates -- no StarCraft II needed")
