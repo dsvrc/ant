@@ -66,6 +66,18 @@ class SeverityMixin(object):
 
     def __init__(self, args, **kwargs):
         a = dict(args or {})
+
+        # *** SET BEFORE THE HOST'S __init__ RUNS. ***
+        # StarCraft2Env declares its observation space inside its own __init__,
+        # which calls self.get_obs_size() -- and that is OUR override.  Anything
+        # an override reads must therefore exist before super() is entered, not
+        # after it returns.  This is the whole hazard of a mixin over a host that
+        # calls its own virtuals during construction, and `selftest.py`'s
+        # `mixin_survives_host_calling_its_overrides_during_init` reproduces the
+        # exact crash so it cannot come back silently.
+        self.ns_augment = bool(int(a.get("ns_augment", 0)))
+        self.ns_cost = None              # get_obs_agent guards on this being set
+
         super(SeverityMixin, self).__init__(args, **kwargs)
 
         # ---- read severity from the TASK config (NS-3.1) --------------------
@@ -101,12 +113,13 @@ class SeverityMixin(object):
         # the layer, not a wrapper around it -- computed outside, it would see a
         # different trajectory and stop being a ceiling for this one.
         self.ns_oracle = bool(int(a.get("ns_oracle", 0)))
-        # Append the per-action predicted cost to the observation so the policy's
-        # steering head can read it.  The head peels the tail off before the base
-        # network, so every PACT-family arm has the identical base network and
-        # `pactoff` is bit-identical to blind.  Off for the stock baselines, which
-        # then run on byte-identical stock SMAC observations inside the same dial.
-        self.ns_augment = bool(int(a.get("ns_augment", 0)))
+        # (ns_augment is set ABOVE, before super().__init__ -- see the note there.)
+        # It appends the per-action predicted cost to the observation so the
+        # policy's steering head can read it.  The head peels the tail off before
+        # the base network, so every PACT-family arm has the identical base
+        # network and `pactoff` is bit-identical to blind.  Off for the stock
+        # baselines, which then run on byte-identical stock SMAC observations
+        # inside the same dial.
         self._rls = [AgentRLS(self.coupling.r + 1, mu=self.ns_mu, p0=self.ns_p0)
                      for _ in range(self.n_agents)]
 
@@ -320,8 +333,13 @@ class SeverityMixin(object):
         o = super(SeverityMixin, self).get_obs_agent(agent_id)
         if not self.ns_augment:
             return o
+        # The host may call this during construction, before the per-step buffers
+        # exist; a zero tail is the correct value then (no prediction has been
+        # made yet) and it keeps the declared shape honest either way.
+        cost = (np.zeros(self.n_actions, dtype=np.float32)
+                if self.ns_cost is None else self.ns_cost[agent_id])
         return np.concatenate([np.asarray(o, dtype=np.float32),
-                               self.ns_cost[agent_id].astype(np.float32)])
+                               np.asarray(cost, dtype=np.float32)])
 
     def get_obs_size(self):
         sz = super(SeverityMixin, self).get_obs_size()

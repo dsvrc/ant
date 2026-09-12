@@ -238,6 +238,67 @@ def t_estimator(c):
           "0 = perfectly spread, 1 = everyone on one option")
 
 
+# ========================================================================= mixin
+class _StubHost(object):
+    """A host that calls its OWN virtuals during construction, exactly as
+    StarCraft2Env does -- it declares the observation space inside __init__ by
+    calling ``self.get_obs_size()``.  That is the shape of the bug this class
+    exists to catch, and it cost a launch on the cluster."""
+
+    def __init__(self, args, **kwargs):
+        self.map_name = args["map_name"]
+        self.n_agents, self.n_enemies = 8, 8
+        self.episode_limit, self._step_mul = 150, 8
+        self.n_actions_no_attack = 6
+        self.n_actions = self.n_actions_no_attack + self.n_enemies
+        self._controller = None
+        self.agents = {i: None for i in range(self.n_agents)}
+        self.enemies = {i: None for i in range(self.n_enemies)}
+        # the two host calls that reach our overrides mid-construction
+        self.observation_space = [self.get_obs_size() for _ in range(self.n_agents)]
+        self._probe_obs = self.get_obs_agent(0)
+
+    def get_obs_size(self):
+        return [100, [7, 4], [8, 5], [1, 4], [1, 1]]
+
+    def get_obs_agent(self, agent_id):
+        return np.zeros(100, dtype=np.float32)
+
+    def reset(self):
+        return None
+
+
+def t_mixin():
+    print("mixin over the host  (the construction-order hazard)")
+    from .layer import SeverityMixin
+
+    class _Env(SeverityMixin, _StubHost):
+        pass
+
+    ok, why = True, ""
+    try:
+        e = _Env({"map_name": MAP, "ns_severity": 1.0, "ns_augment": 1})
+    except Exception as exc:                       # the exact cluster crash
+        ok, why, e = False, "%s: %s" % (type(exc).__name__, exc), None
+    check("mixin_survives_host_calling_its_overrides_during_init", ok, why)
+    if e is None:
+        return
+    base = _StubHost({"map_name": MAP}).get_obs_size()[0]
+    check("augmented_obs_size_matches_the_augmented_obs",
+          e.get_obs_size()[0] == base + e.n_actions
+          and len(e.get_obs_agent(0)) == base + e.n_actions,
+          "declared %d == actual %d (base %d + %d actions)"
+          % (e.get_obs_size()[0], len(e.get_obs_agent(0)), base, e.n_actions))
+
+    class _Env2(SeverityMixin, _StubHost):
+        pass
+
+    e2 = _Env2({"map_name": MAP, "ns_severity": 1.0, "ns_augment": 0})
+    check("stock_baselines_see_byte_identical_stock_observations",
+          e2.get_obs_size()[0] == base and len(e2.get_obs_agent(0)) == base,
+          "no tail when ns_augment = 0, so mappo/happo run on stock SMAC obs")
+
+
 def main():
     print("=" * 78)
     print("SMAC-NS conformance suite -- offline, no StarCraft II")
@@ -247,6 +308,7 @@ def main():
     t_harm(c, d)
     t_ceiling(c, d)
     t_estimator(c)
+    t_mixin()
     print("=" * 78)
     if FAILS:
         print("FAILED %d check(s): %s" % (len(FAILS), ", ".join(FAILS)))
