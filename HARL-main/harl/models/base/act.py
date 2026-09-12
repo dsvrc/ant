@@ -41,7 +41,8 @@ class ACTLayer(nn.Module):
                 )
             self.action_outs = nn.ModuleList(action_outs)
 
-    def forward(self, x, available_actions=None, deterministic=False):
+    def forward(self, x, available_actions=None, deterministic=False,
+                logit_bias=None):
         """Compute actions and action logprobs from given input.
         Args:
             x: (torch.Tensor) input to network.
@@ -71,7 +72,7 @@ class ACTLayer(nn.Module):
                 dim=-1, keepdim=True
             )
         else:
-            action_distribution = self.action_out(x, available_actions)
+            action_distribution = self.action_out(x, available_actions, logit_bias)
             actions = (
                 action_distribution.mode()
                 if deterministic
@@ -81,7 +82,7 @@ class ACTLayer(nn.Module):
 
         return actions, action_log_probs
 
-    def get_logits(self, x, available_actions=None):
+    def get_logits(self, x, available_actions=None, logit_bias=None):
         """Get action logits from inputs.
         Args:
             x: (torch.Tensor) input to network.
@@ -96,12 +97,13 @@ class ACTLayer(nn.Module):
                 action_distribution = action_out(x, available_actions)
                 action_logits.append(action_distribution.logits)
         else:
-            action_distribution = self.action_out(x, available_actions)
+            action_distribution = self.action_out(x, available_actions, logit_bias)
             action_logits = action_distribution.logits
 
         return action_logits
 
-    def evaluate_actions(self, x, action, available_actions=None, active_masks=None):
+    def evaluate_actions(self, x, action, available_actions=None,
+                         active_masks=None, logit_bias=None):
         """Compute action log probability, distribution entropy, and action distribution.
         Args:
             x: (torch.Tensor) input to network.
@@ -140,7 +142,7 @@ class ACTLayer(nn.Module):
             )
             return action_log_probs, dist_entropy, None
         else:
-            action_distribution = self.action_out(x, available_actions)
+            action_distribution = self.action_out(x, available_actions, logit_bias)
             action_log_probs = action_distribution.log_probs(action)
             if active_masks is not None:
                 if self.action_type == "Discrete":

@@ -60,12 +60,11 @@ ALGO_REGISTRY = {
     # O-MAX uses the stock HAPPO actor; the ladder's advantages are all env-side
     # (hardwired compensation, privileged obs) + a flag-gated std floor.
     "omax": HAPPO,
-    # PACT uses the stock HAPPO actor; the whole method is env-side (the exact
-    # peer-action waveform x2, the compensation, and the extra bounded beta-control
-    # action dim are all in PactMujocoMulti) plus pact_debug logging in the runner.
-    # HAPPO sizes itself from the (extended) action/obs/share spaces the wrapper
-    # declares, so the extra action dim is learned by standard PPO.
-    "pact": HAPPO,
+    # PACT-1 on SMAC-NS uses the stock MAPPO actor -- MAPPO is the standard SMAC
+    # baseline and the arm it must be compared against, so the method's host is
+    # the baseline's host.  (The legacy MAMuJoCo PACT arm is `pact_1`, which is
+    # still HAPPO-hosted; `pact_happo` is the HAPPO-hosted SMAC variant.)
+    "pact": MAPPO,
     # PACT-1 is PACT with the coupling operator W UNKNOWN: the wrapper carries a
     # per-agent RLS that tracks the drifting r-vector beta* = c*theta from the leg's
     # own torque sensor, and the policy learns only TRUST in that estimate (one
@@ -77,9 +76,15 @@ ALGO_REGISTRY = {
     # baselines running the identical actor on the identical obs/action spaces.
     # The whole method is in harl/envs/smac/fc/, so an arm difference cannot be an
     # algorithm difference (PACT_PIPELINE_SPEC 1).
-    "pact_mappo": MAPPO,
-    "happo_fc": HAPPO,
-    "mappo_fc": MAPPO,
+    # PACT-1 on SMAC-NS: the ACTOR IS STOCK.  The method is a single trust
+    # scalar inside StochasticPolicy plus the severity layer in the env, so every
+    # arm shares the host's update rule byte for byte (P-9.1).
+    "pactoff": MAPPO,
+    "pact_fixed": MAPPO,
+    "pact_oracle": MAPPO,
+    "pact_intercept": MAPPO,
+    "pact_happo": HAPPO,
+    "pact_happo_off": HAPPO,
     # PCR diagnosis campaign: the host policy/critic are HASAC's, untouched
     # (Prohibition 2 — host hyperparameters identical across every arm). The
     # telemetry lives entirely in OffPolicyDiagRunner.

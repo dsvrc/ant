@@ -1,6 +1,4 @@
-# PACT-1 on SMAC-NS, MAPPO host, trust LEARNED.  `--algo pact --env smac`
-# Everything below is mappo.yaml byte for byte: the method is the trust term
-# in the actor and the severity layer in the env, and nothing else.
+# PACT-1 on the HAPPO host, trust forced to 0 -- its matched baseline.
 seed:
   # whether to use the specified seed
   seed_specify: True
@@ -115,9 +113,9 @@ algo:
   # method of aggregating the probability of multi-dimensional actions, choose from prod, mean
   action_aggregation: prod
   # whether to share parameter among actors
-  share_param: True
+  share_param: False
   # whether to use a fixed optimisation order
-  fixed_order: True
+  fixed_order: False
 logger:
   # logging directory
   log_dir: "./results"

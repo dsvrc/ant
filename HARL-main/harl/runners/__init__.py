@@ -25,12 +25,30 @@ from harl.runners.on_policy_recon_runner import OnPolicyReconRunner
 from harl.runners.on_policy_omax_runner import OnPolicyOmaxRunner
 from harl.runners.on_policy_pact_runner import OnPolicyPactRunner
 from harl.runners.on_policy_pact_smac_runner import OnPolicyPactSmacRunner
-from harl.runners.on_policy_pact_fc_runner import (
-    OnPolicyFcBlindHappoRunner,
-    OnPolicyFcBlindRunner,
-    OnPolicyPactFcHappoRunner,
-    OnPolicyPactFcRunner,
+from harl.runners.on_policy_pact_ns_runner import (
+    PactNsFixedRunner,
+    PactNsHappoOffRunner,
+    PactNsHappoRunner,
+    PactNsInterceptRunner,
+    PactNsOffRunner,
+    PactNsOracleRunner,
+    PactNsRunner,
 )
+
+
+# PACT-1 on SMAC-NS (Coupling Under Drift).  Five arms through the IDENTICAL
+# wrapper, differing only in the trust term -- P-9.1.  The severity layer reaches
+# every algorithm in the repo (it is in the env config), so `mappo`, `happo` and
+# the rest are baselines inside the same physics, not a different task.
+_PACT_NS = {
+    "pact": PactNsRunner,
+    "pactoff": PactNsOffRunner,
+    "pact_fixed": PactNsFixedRunner,
+    "pact_oracle": PactNsOracleRunner,
+    "pact_intercept": PactNsInterceptRunner,
+    "pact_happo": PactNsHappoRunner,
+    "pact_happo_off": PactNsHappoOffRunner,
+}
 
 
 def _pact_runner(args, algo_args, env_args):
@@ -43,7 +61,7 @@ def _pact_runner(args, algo_args, env_args):
       mamujoco -> the continuous PACT runner.
     """
     if args["env"] == "smac":
-        return OnPolicyPactFcHappoRunner(args, algo_args, env_args)
+        return PactNsRunner(args, algo_args, env_args)
     if args["env"] == "smacv2":
         return OnPolicyPactSmacRunner(args, algo_args, env_args)
     return OnPolicyPactRunner(args, algo_args, env_args)
@@ -91,6 +109,13 @@ RUNNER_REGISTRY = {
     # the arithmetic exactness gate.  Dispatched by env: mamujoco (continuous, learned
     # beta) vs smac/smacv2 (discrete soft variant, obs-augmentation, gate-only).
     "pact": _pact_runner,
+    "pactoff": _PACT_NS["pactoff"],
+    "pact_fixed": _PACT_NS["pact_fixed"],
+    "pact_oracle": _PACT_NS["pact_oracle"],
+    "pact_intercept": _PACT_NS["pact_intercept"],
+    "pact_happo": _PACT_NS["pact_happo"],
+    "pact_happo_off": _PACT_NS["pact_happo_off"],
+
     # PACT-1: same dispatch. The wrapper emits the same pact_* info keys the runner
     # already reads, so pact_debug.csv works unchanged -- except the gate now
     # compares the PREDICTED load d_hat against the true pcr_d_next, which is a
@@ -100,9 +125,6 @@ RUNNER_REGISTRY = {
     # host; `happo_fc` / `mappo_fc` are the matching BLIND baselines, which train
     # bit-identically to happo / mappo and only add the fc_debug.csv telemetry --
     # so an inert dial is visible in the arm that would otherwise report nothing.
-    "pact_mappo": OnPolicyPactFcRunner,
-    "happo_fc": OnPolicyFcBlindHappoRunner,
-    "mappo_fc": OnPolicyFcBlindRunner,
     # PCR diagnosis campaign: HASAC + read-only, RNG-transparent telemetry.
     # Not a method — with telemetry off it IS hasac, and with it on the training
     # trajectory is still bit-identical (see OffPolicyDiagRunner._rng_frozen).

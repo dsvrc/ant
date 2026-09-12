@@ -1,7 +1,6 @@
-# BLIND baseline on Formation Congestion -- HAPPO host, no compensator.
-# Bit-identical training to `--algo happo`, plus fc_debug.csv.  This is the arm
-# `--algo pact` is compared against.
-# Bit-identical training to `--algo happo`, plus fc_debug.csv.
+# PACT-1 on SMAC-NS, HAPPO host, trust LEARNED.  Identical env layer to
+# `--algo pact`; only the host differs, which is the check that the mechanism
+# is not a property of one update rule.
 seed:
   # whether to use the specified seed
   seed_specify: True

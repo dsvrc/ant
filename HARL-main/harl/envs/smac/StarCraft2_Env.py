@@ -223,15 +223,7 @@ class StarCraft2Env(MultiAgentEnv):
         self.n_agents = map_params["n_agents"]
         self.n_enemies = map_params["n_enemies"]
         self.episode_limit = map_params["limit"]
-
         self._move_amount = move_amount
-        # --- the ONE hook the Formation-Congestion NS needs (harl/envs/smac/fc/) ---
-        # Stock SMAC sends every move order to a point `_move_amount` away.  The NS
-        # throttles a unit's delivered step by scaling THAT distance, and PACT's
-        # channel inverse scales it back up.  Nothing else in this file reads it; when
-        # no wrapper is attached (or severity is 0) every entry is exactly 1.0 and the
-        # commands issued are byte-identical to stock SMAC.
-        self.move_stride = np.ones(self.n_agents, dtype=np.float64)
         self._step_mul = step_mul
         self.difficulty = difficulty
 
@@ -453,7 +445,6 @@ class StarCraft2Env(MultiAgentEnv):
         self.defeat_counted = False
 
         self.last_action = np.zeros((self.n_agents, self.n_actions), dtype=np.float32)
-        self.move_stride[:] = 1.0  # FC hook: neutral until a wrapper drives it
 
         if self.heuristic_ai:
             self.heuristic_targets = [None] * self.n_agents
@@ -563,6 +554,14 @@ class StarCraft2Env(MultiAgentEnv):
             self._controller.step(self._step_mul)
             # Observe here so that we know if the episode is over.
             self._obs = self._controller.observe()
+            # --- the ONE hook the severity layer needs (harl/envs/smac/smac_ns/) ---
+            # Runs AFTER the engine has applied the step and BEFORE update_units()
+            # snapshots the state, so the reward, the observation, the termination
+            # test and the logged records all describe the same episode.  That is
+            # NS-3.2 obtained at a single point instead of by patching three call
+            # sites.  The base implementation does nothing at all, so this file is
+            # behaviourally identical to stock SMAC unless a layer is mixed in.
+            self._ns_hook(actions_int)
         except (protocol.ProtocolError, protocol.ConnectionError):
             self.full_restart()
             terminated = True
@@ -716,14 +715,21 @@ class StarCraft2Env(MultiAgentEnv):
 
         return local_obs, global_state, rewards, dones, infos, available_actions
 
+    def _ns_hook(self, actions_int):
+        """No-op. Overridden by the severity layer; see smac_ns/layer.py.
+
+        Kept in the host so the layer is a MIXIN rather than a wrapper: a wrapper
+        cannot reach inside ``step`` between the engine tick and ``update_units``,
+        which is the only place harm can touch reward and record together.
+        """
+        return
+
     def get_agent_action(self, a_id, action):
         """Construct the action for agent a_id."""
         avail_actions = self.get_avail_agent_actions(a_id)
         assert avail_actions[action] == 1, "Agent {} cannot perform action {}".format(
             a_id, action
         )
-        # FC hook: this unit's delivered stride this step (1.0 == stock SMAC).
-        move_amount = self._move_amount * float(self.move_stride[a_id])
 
         unit = self.get_unit_by_id(a_id)
         tag = unit.tag
@@ -748,7 +754,7 @@ class StarCraft2Env(MultiAgentEnv):
             # move north
             cmd = r_pb.ActionRawUnitCommand(
                 ability_id=actions["move"],
-                target_world_space_pos=sc_common.Point2D(x=x, y=y + move_amount),
+                target_world_space_pos=sc_common.Point2D(x=x, y=y + self._move_amount),
                 unit_tags=[tag],
                 queue_command=False,
             )
@@ -759,7 +765,7 @@ class StarCraft2Env(MultiAgentEnv):
             # move south
             cmd = r_pb.ActionRawUnitCommand(
                 ability_id=actions["move"],
-                target_world_space_pos=sc_common.Point2D(x=x, y=y - move_amount),
+                target_world_space_pos=sc_common.Point2D(x=x, y=y - self._move_amount),
                 unit_tags=[tag],
                 queue_command=False,
             )
@@ -770,7 +776,7 @@ class StarCraft2Env(MultiAgentEnv):
             # move east
             cmd = r_pb.ActionRawUnitCommand(
                 ability_id=actions["move"],
-                target_world_space_pos=sc_common.Point2D(x=x + move_amount, y=y),
+                target_world_space_pos=sc_common.Point2D(x=x + self._move_amount, y=y),
                 unit_tags=[tag],
                 queue_command=False,
             )
@@ -781,7 +787,7 @@ class StarCraft2Env(MultiAgentEnv):
             # move west
             cmd = r_pb.ActionRawUnitCommand(
                 ability_id=actions["move"],
-                target_world_space_pos=sc_common.Point2D(x=x - move_amount, y=y),
+                target_world_space_pos=sc_common.Point2D(x=x - self._move_amount, y=y),
                 unit_tags=[tag],
                 queue_command=False,
             )
@@ -818,9 +824,6 @@ class StarCraft2Env(MultiAgentEnv):
     def get_agent_action_heuristic(self, a_id, action):
         unit = self.get_unit_by_id(a_id)
         tag = unit.tag
-        # FC hook: the built-in heuristic is a controller like any other, so the
-        # congestion throttle reaches it too -- the NS is task physics.
-        move_amount = self._move_amount * float(self.move_stride[a_id])
 
         target = self.heuristic_targets[a_id]
         if unit.unit_type == self.medivac_id:
@@ -887,23 +890,23 @@ class StarCraft2Env(MultiAgentEnv):
             if abs(delta_x) > abs(delta_y):  # east or west
                 if delta_x > 0:  # east
                     target_pos = sc_common.Point2D(
-                        x=unit.pos.x + move_amount, y=unit.pos.y
+                        x=unit.pos.x + self._move_amount, y=unit.pos.y
                     )
                     action_num = 4
                 else:  # west
                     target_pos = sc_common.Point2D(
-                        x=unit.pos.x - move_amount, y=unit.pos.y
+                        x=unit.pos.x - self._move_amount, y=unit.pos.y
                     )
                     action_num = 5
             else:  # north or south
                 if delta_y > 0:  # north
                     target_pos = sc_common.Point2D(
-                        x=unit.pos.x, y=unit.pos.y + move_amount
+                        x=unit.pos.x, y=unit.pos.y + self._move_amount
                     )
                     action_num = 2
                 else:  # south
                     target_pos = sc_common.Point2D(
-                        x=unit.pos.x, y=unit.pos.y - move_amount
+                        x=unit.pos.x, y=unit.pos.y - self._move_amount
                     )
                     action_num = 3
 

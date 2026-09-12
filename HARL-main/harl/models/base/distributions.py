@@ -48,8 +48,15 @@ class Categorical(nn.Module):
 
         self.linear = init_(nn.Linear(num_inputs, num_outputs))
 
-    def forward(self, x, available_actions=None):
+    def forward(self, x, available_actions=None, logit_bias=None):
         x = self.linear(x)
+        # PACT's steering channel enters HERE and nowhere else: an additive shift
+        # on the logits, INSIDE the softmax, so the ordinary policy gradient
+        # already flows into the trust parameter with no new sampled dimension and
+        # no extra log-probability term (PACT_NS_SPEC P-6.2).  `None` leaves this
+        # function byte-identical to stock.
+        if logit_bias is not None:
+            x = x + logit_bias
         if available_actions is not None:
             x[available_actions == 0] = -1e10
         return FixedCategorical(logits=x)

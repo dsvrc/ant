@@ -1,12 +1,5 @@
-# BLIND baseline on Formation Congestion -- MAPPO host, no compensator.
-#
-# Trains bit-identically to `--algo mappo`; it only ALSO writes fc_debug.csv, so a
-# silently inert dial is visible in the arm that would otherwise report nothing
-# (PACT_PIPELINE_SPEC 9).  Every hyperparameter below is mappo.yaml's, unchanged.
-#
-# Trains bit-identically to `--algo mappo`; it only ALSO writes fc_debug.csv, so a
-# silently inert dial is visible in the arm that would otherwise report nothing
-# (PACT_PIPELINE_SPEC 9).  Every hyperparameter below is mappo.yaml's, unchanged.
+# PACT-1 steered on the TRUE excess -- the CEILING arm.  No method can
+# beat it, so every margin is read against it.
 seed:
   # whether to use the specified seed
   seed_specify: True

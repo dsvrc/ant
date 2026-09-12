@@ -1,8 +1,6 @@
-# PACT on Formation Congestion -- MAPPO host.  `--algo pact_mappo --env smac`
-#
-# Identical env wrappers to `--algo pact`; only the host differs.  Shipping both
-# is the check that the mechanism is not a property of one update rule.  Its
-# blind baseline is `--algo mappo_fc`.  Every line below is mappo.yaml's.
+# PACT-1, trust forced to 0.  THE HONEST BASELINE -- provably bit-identical
+# to the untouched host: the shift returns the logits unchanged and the trust
+# parameter is never created, so the base network is the stock one.
 seed:
   # whether to use the specified seed
   seed_specify: True

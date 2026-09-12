@@ -82,51 +82,32 @@ def _pcr_eval_env_args(env_args, rank, n_threads):
     return ea, offset
 
 
-def _fc_dephase(env_args, rank, n_threads):
-    """Per-rank copy of ``env_args`` carrying this SMAC env's driver phase.
-
-    The Formation-Congestion driver A(t) is a raised cosine over one episode
-    limit.  With every parallel env on the same clock a whole PPO batch sees ONE
-    phase of the driver (the critic chases a moving target) and, worse, a whole
-    EVAL round becomes a single-phase snapshot, so the reported win rate measures
-    the driver phase rather than the policy.  NS_FORM_SPEC E.2 pitfall 6:
-    "sampling only the mild end understates the dial -- spread across it."
-
-    Spreading rank r to phase r/n_threads makes every batch and every eval round a
-    true cycle-average.  Copies the dict per rank -- never mutates the shared one.
-    """
-    if n_threads <= 1:
-        return env_args
-    return {**env_args, "ns_phase": float(rank) / float(n_threads)}
-
-
 def make_smac_env(env_args, rank=0, n_threads=1, seed=None):
-    """Build a SMAC env with the Formation-Congestion stack.
+    """Build a SMAC env with the Coupling-Under-Drift severity layer mixed in.
 
-        StarCraft2Env                 stock, byte for byte
-          +-- FormationCongestionEnv  the NS dial   (env_args["fc"], default ON)
-                +-- PactEnv           the compensator (env_args["pact"], default OFF)
+        StarCraft2Env                 stock, one no-op hook
+          +-- SmacNsEnv(mixin, ..)    the dial.  EVERY arm gets it (NS-3.1).
 
-    NS_FORM_SPEC B.5: the dial sits BELOW the method, so MAPPO, HAPPO and every
-    other baseline run inside exactly the same physics as PACT and a dial only the
-    method experienced is impossible by construction.  ``fc: 0`` gives plain stock
-    SMAC for a B0 reference run.
+    The dial is read from the TASK config, never from a method's block, so a
+    baseline and the method run inside identical physics and only the trust term
+    differs.  ``ns_on: 0`` gives plain stock SMAC for a B0 reference run.
     """
-    from harl.envs.smac.StarCraft2_Env import StarCraft2Env
+    a = dict(env_args)
+    if n_threads > 1:
+        # De-phase the guard clock across workers so a rollout batch is a true
+        # cycle average rather than one phase of it.
+        a["ns_phase0"] = int(a.get("ns_phase0", 0)) + int(
+            rank * int(a.get("ns_period", 150)) / max(1, n_threads))
+    if not int(a.get("ns_on", 1)):
+        from harl.envs.smac.StarCraft2_Env import StarCraft2Env
 
-    a = _fc_dephase(env_args, rank, n_threads)
-    env = StarCraft2Env(a)
+        env = StarCraft2Env(a)
+    else:
+        from harl.envs.smac.smac_ns import make_smac_ns_env
+
+        env = make_smac_ns_env(a)
     if seed is not None:
         env.seed(seed)
-    if not int(a.get("fc", 1)):
-        return env
-    from harl.envs.smac.fc.severity_env import FormationCongestionEnv
-
-    env = FormationCongestionEnv(env, {**a, "ns_seed": int(a.get("ns_seed", rank))})
-    if int(a.get("pact", 0)):
-        from harl.envs.smac.fc.pact_env import PactEnv
-
-        env = PactEnv(env, a)
     return env
 
 
@@ -231,10 +212,9 @@ def make_eval_env(env_name, seed, n_threads, env_args):
     if env_name == "dexhands":  # dexhands does not support running multiple instances
         raise NotImplementedError
 
-    # Eval envs SKIP any training severity curriculum -- they always run the full
-    # severity, so evaluation measures the harmed task rather than the warmup.
-    # Harmless for other envs (only the SMAC severity wrapper reads "ns_eval").
-    env_args = {**env_args, "ns_eval": 1}
+    # Eval runs at the same severity as training: there is no curriculum, so
+    # there is nothing to skip, and a severity only the eval envs saw would make
+    # the eval curve describe a different task from the one that was trained.
 
     def get_env_fn(rank):
         def init_env():

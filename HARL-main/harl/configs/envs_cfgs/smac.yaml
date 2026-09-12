@@ -1,118 +1,58 @@
-map_name: 1c3s5z
-# CALIBRATED, not chosen.  Two measurements picked this map and one picked the
-# dial, all before any method ran; k2.json / fc_headroom*.json hold the output.
-#
-#   movement headroom (a movement-competent control vs focus-fire, at sigma=0):
-#     1c3s5z 1.77x   3s_vs_5z 3.06x   2s3z 0.84x   3s5z 0.83x   MMM2 0.78x
-#   declared operator structure (spread / asymmetry / max:min):
-#     1c3s5z 0.992 / 0.333 / 28x      <- the best in the benchmark
-#     3s_vs_5z 0.000 / 0.000 / 1.0x   <- DEGENERATE: 3 Stalkers, one unit type,
-#                                        so the "operator beats a proxy" ablation
-#                                        cannot be run there at all
-#   1c3s5z is the only map that has BOTH.
-ns_k_scale_note: |
-  k_scale = 0.08 from the sweep in k2.json (1c3s5z, kite control, ~110 episodes
-  per row).  Across all six dial strengths the PRIVILEGED oracle returned
-  19.49 +- 0.14 against a sigma=0 line of 19.43 -- flat, at the line, at every
-  severity.  The blind arm meanwhile fell monotonically 19.44 -> 17.14.  At
-  k_scale = 0.08 the dial costs the blind arm 2.29 (t = 6.0) and the oracle
-  recovers 97% of it.  The three strongest dials (0.08 / 0.12 / 0.18) are
-  statistically indistinguishable in G4b, so the result does not balance on the
-  constant.
-  G4b = 1.130, BELOW the spec's 1.30 bar, and that is recorded here rather than
-  worked around: G4b is a RATIO, and the ratio is capped by how much the dial can
-  cost, which on this map is ~12% because the reference already wins at 97% of
-  the maximum return.  The substantive requirement -- "is there a gap for a
-  method to close" -- is met at t = 6.0 and a perfect compensator closes 97% of
-  it.  Whether that is enough is a judgement, and it must be recorded BEFORE the
-  method runs, not after.
-state_type: FP # choose from FP (Feature Pruned) and EP (Environment Provided)
+map_name: 3s5z            # SOLVED by MAPPO/HAPPO at ~90-95% win. The dial is
+                          # aimed at what that policy actually learned -- focus
+                          # fire -- so existing algorithms have something to lose.
+state_type: FP            # choose from FP (Feature Pruned) and EP (Environment Provided)
 
 # ===========================================================================
-# Formation Congestion -- the non-stationarity.  TASK PHYSICS, NOT A METHOD KNOB.
+# SMAC-NS -- Coupling Under Drift.  CELL: (C, no inverse) -- steering only.
 # ---------------------------------------------------------------------------
-# NS_FORM_SPEC B.5: the dial lives here, in the ENV config, so every arm --
-# MAPPO, HAPPO, PACT, anything -- runs inside identical physics.  A dial only the
-# method's arm experienced would be worthless as evidence.
+# TASK PHYSICS, NOT A METHOD KNOB (NS-3.1).  The dial lives here so MAPPO, HAPPO
+# and PACT all run inside identical physics; a dial only the method's arm
+# experienced would be worthless as evidence.
 #
-# Story: StarCraft II ground units are rigid collision bodies that block each
-# other.  A unit's medium is the ground it has to move through; the more of the
-# squad is alive and engaging around it, the less of its ordered step it actually
-# takes.  The enemy line's push/consolidate cycle squeezes the squad's usable
-# frontage, so the capacity of that medium shrinks and shrinks on a cycle.
+#   medium    the enemy line's absorbable damage.  Element = an enemy unit,
+#             capacity = its PUBLISHED effective hit points (Zealot 150,
+#             Stalker 160).  Overkill is the canonical SMAC coordination
+#             failure -- "stop overkilling that zealot".
+#   loading   u_i = (peer damage on my target) / capacity,  sum over j != i
+#   driver    the enemy line's guard cycle.  Shrinks absorption, never adds to
+#             the loss.  Reaches EXACTLY zero for half of every episode.
+#   harm      excess_i = f(u/g)/f(u) - 1,  f(u) = 1 + alpha*u.  Handed back to
+#             the engine as restored hit points; the REWARD FUNCTION IS
+#             UNTOUCHED byte for byte.
 #
-#   u_i    = L_i / K_i ,   L_i^m = sum_j W[i,j] prox_ij cone_ij^m Phi_j + L^fix
-#   K_i(t) = K_i^0 * g(sigma, A(t))                     <- the driver, capacity only
-#   Delta_i = u_i * (1 - g)                             <- the delivery deficit
-#   delivered_i = base_i * cmd_i * (1 - Delta_i)        <- multiplicative, invertible
-#
-# At sigma = 0, g == 1 and Delta == 0 identically: stock SMAC, byte for byte.
-# At N = 1 the peer sum is empty, so the cross-agent term is exactly 0 however
-# small g becomes -- category C, structurally.
+# A LONE AGENT CANNOT OVERKILL, so u_i = 0 and harm = 1.0 EXACTLY at any
+# severity -- category C obtained structurally, from the j != i, not from a
+# small number.  Verified at g = 1e-3 in smac_ns/selftest.py.
 # ===========================================================================
-fc: 1                 # 0 = plain stock SMAC (use for a B0 reference run)
-ns_severity: 1.0      # THE ONE KNOB.  0 = stock.  >1 is a beyond-physical stress
-                      # test and must be labelled as such in every table.
-ns_period: ~          # driver period in env steps; ~ = one cycle per episode limit
-ns_knee: 0.35         # A(t) <= knee is the PLACEBO REGIME: g == 1 exactly at every
-                      # severity, so ~35% of every cycle is provably inert (B.4)
-ns_depth: 0.60        # capacity shrink at sigma=1, A=1.  The sigma=1 anchor;
-                      # fc/certificates.py measures the game's own congestion
-ns_floor: 0.25        # g never drops below this
-ns_harm_max: 0.75     # Delta cap -- a unit is never fully immobilised
-ns_k_scale: 0.08      # the medium's units.  CALIBRATED on this map against the
-                      # measured-stronger control (k2.json); see ns_k_scale_note.
-                      # Frozen before any method runs, identical for every arm.
-ns_phi_fire: 1.0      # Phi_j = alive_j * (1 + phi_fire * fired_j).  alive is the
-                      # UNCANCELLABLE floor (A.5); firing is what makes it vary
-ns_phi_rho: 0.6       # obstruction has inertia -- ~3-step memory.  This is what
-                      # makes PACT's one-step peer persistence sound (spec 4.2)
-ns_phi_move: 0.0      # >0 makes Phi read the EXECUTED stride => LOOP-COUPLED
-                      # (A.6) and T4 applies.  0 = the loop-free contrast case,
-                      # which is what the spec's E-table PREDICTS for SMAC
-ns_prox_len: 2.0      # obstruction decay length (world units)
-ns_band_scale: 2.0    # how fast obstruction falls off with a weapon-range gap
-ns_reach_clip: 1      # clip the base move order to the unit's own one-step reach
-                      # (removes the dead zone; changes no displacement).  0 = raw
-ns_sensor_noise: 0.0  # declared sensor noise, drawn from its own generator
-ns_mean_preserving: 0 # D.2 option 2: normalise g by its cycle mean so only the
-                      # SHAPE varies.  Satisfies G4a at the cost of B.1.3 (g then
-                      # exceeds 1 somewhere), so it is off and reported when on
-ns_warmup: 0          # curriculum, in env steps.  OFF ON PURPOSE: at severity 0
-ns_ramp: 0            # the compensator is provably inert, so an arm comparison
-                      # inside a warmup window measures basin luck, not method
+ns_on: 1                  # 0 = plain stock SMAC (B0 reference run)
+ns_severity: 1.0          # THE ONE KNOB.  sigma=1 is anchored to SC2's own
+                          # armour arithmetic: one armour point subtracts 1 from
+                          # a Stalker's 10-damage hit = exactly 10%.
+                          # sigma > 1 is a BEYOND-PHYSICAL STRESS TEST and must
+                          # be labelled as such in every table and figure.
+ns_period: 150            # guard cycle, in env steps (one 3s5z episode limit)
+ns_guard_frac: 0.5        # the rest of the cycle is the PLACEBO: A(t) is exactly
+                          # 0 there, so g == 1.0000 for every sigma and the whole
+                          # sweep is byte-identical (NS-2.5)
+ns_loss: 0.10             # the published anchor.  Do not round it to taste.
+ns_alpha: 2.28            # the LINEAR performance coefficient.  The medium runs
+                          # at u ~ 0.21 (URB: 0.219), two orders below where a
+                          # quartic exponent means anything, so the form is
+                          # linear by regime and not by convention (III.1).
+ns_mean_preserving: 0     # NS-5.1: normalise g by its cycle mean so only the
+                          # SHAPE varies and total capacity is unchanged
+ns_seed: 0                # per-enemy guard sensitivity draw (declared, mean 1)
 
-# ===========================================================================
-# PACT -- the compensator.  Switched on by `--algo pact`; these are its knobs.
-# ===========================================================================
-pact: 0               # DO NOT EDIT: the algo name is the authority.  `--algo pact`
-                      # and `--algo pact_mappo` set it to 1; every other algo gets
-                      # the DIAL and not the method, which is the point of B.5.
-pact_r: 1             # channels.  DEFAULT 1: spec 2.2 measured r=2 WORSE
-                      # conditioned (3006 vs 810), and selfcheck T2 reproduces it
-pact_mu: ~            # RLS forgetting.  ~ = derived from the driver period
-                      # (memory ~ period/12); spec 5.1 says MEASURE it per
-                      # environment, and fc/calibrate.py --sweep mu does
-pact_p0: 1.0
-pact_p_max_mult: 10.0 # covariance windup bound: p_max = mult * p0 * dim (5.2)
-pact_max_trust: 1.0   # the T4 gain cap.  A PHASE-1 CALIBRATION PARAMETER: sweep
-                      # it, report the sweep, calibrate on one seed and VALIDATE
-                      # on held-out seeds (8.4).  0 = feedforward-only arm
-pact_ff_gain: 1.0     # the analytic driver feedforward (spec 7).  It is LOCAL and
-                      # supports no coordination claim, so ff_gain=0 is the arm
-                      # that isolates coordination and ff/peer is always reported
-pact_fit_floor: 0.0   # gate on MEASURED lift over the null, never on a covariance
-pact_ready_updates: 200
-pact_fit_lam: 0.999   # windowed, not cumulative -- a cumulative fit_gain is held
-pact_fit_warmup: 200  # down forever by early negatives (8.2)
-pact_peer_mode: delta # "delta" = the peer term carries the predicted one-step
-                      # CHANGE, so it cannot double-count the feedforward.
-                      # "ema" = spec 6.4 literally, with pact_level_tau
-pact_level_tau: ~
-pact_max_delta: 3.0
-pact_cmd_min: 0.25
-pact_cmd_max: 4.0
-pact_u_active: 0.05   # below this the driver is inert and u is unrecoverable from
-                      # Delta; skipped rather than epsilon-floored (spec 9)
-pact_directional: 0   # Kulhavy directional forgetting, as an ablation against the
-                      # plain-forgetting + trace-bound recipe of 5.1/5.2
+# --- the estimator.  Identical in every arm; only the trust term differs. ---
+ns_mu: 0.999              # RLS forgetting.  DECLARED -- sweep it, never tune it
+ns_p0: 10.0
+ns_clip: 10.0             # sensor clip (P-2.1).  Declared; clip_frac is reported
+
+# --- the arms (P-9.1).  Set by the algo, not edited here. -------------------
+ns_augment: 0             # append the per-action predicted cost to the obs.
+                          # The PACT family sets 1; the policy peels the tail off
+                          # before its base network, so every PACT arm has the
+                          # identical host network.
+ns_oracle: 0              # steer on the TRUE excess = the ceiling arm
+ns_intercept_only: 0      # delete the peer channels = the `intercept` arm

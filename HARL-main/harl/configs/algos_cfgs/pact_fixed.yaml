@@ -1,6 +1,5 @@
-# PACT-1 on SMAC-NS, MAPPO host, trust LEARNED.  `--algo pact --env smac`
-# Everything below is mappo.yaml byte for byte: the method is the trust term
-# in the actor and the severity layer in the env, and nothing else.
+# PACT-1, trust held CONSTANT.  Answers the question the inverted prior
+# invites: is trust learned, or merely well-initialised? (P-9.1)
 seed:
   # whether to use the specified seed
   seed_specify: True

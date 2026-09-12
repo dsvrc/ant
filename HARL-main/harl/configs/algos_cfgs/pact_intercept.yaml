@@ -1,6 +1,6 @@
-# PACT-1 on SMAC-NS, MAPPO host, trust LEARNED.  `--algo pact --env smac`
-# Everything below is mappo.yaml byte for byte: the method is the trust term
-# in the actor and the severity layer in the env, and nothing else.
+# PACT-1 with the PEER CHANNELS DELETED, everything else identical.
+# Separates 'the coupling explained something' from 'the intercept memorised
+# each agent's typical residual'.
 seed:
   # whether to use the specified seed
   seed_specify: True
