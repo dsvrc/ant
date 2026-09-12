@@ -186,9 +186,12 @@ def make_train_env(env_name, seed, n_threads, env_args):
 
                 env = GYMEnv(env_args)
             elif env_name == "football":
-                from harl.envs.football.football_env import FootballEnv
+                # GRF-NS: the Coupling-Under-Drift layer, read from the TASK config
+                # so EVERY algorithm runs inside the same physics (NS-3.1).
+                # ``ns_on: 0`` gives the stock FootballEnv for a B0 reference run.
+                from harl.envs.football.grf_ns import make_football_ns_env
 
-                env = FootballEnv(env_args)
+                env = make_football_ns_env(env_args, rank, n_threads)
             elif env_name == "lag":
                 from harl.envs.lag.lag_env import LAGEnv
 
@@ -312,9 +315,12 @@ def make_eval_env(env_name, seed, n_threads, env_args):
 
                 env = GYMEnv(env_args)
             elif env_name == "football":
-                from harl.envs.football.football_env import FootballEnv
+                # GRF-NS: the Coupling-Under-Drift layer, read from the TASK config
+                # so EVERY algorithm runs inside the same physics (NS-3.1).
+                # ``ns_on: 0`` gives the stock FootballEnv for a B0 reference run.
+                from harl.envs.football.grf_ns import make_football_ns_env
 
-                env = FootballEnv(env_args)
+                env = make_football_ns_env(env_args, rank, n_threads)
             elif env_name == "lag":
                 from harl.envs.lag.lag_env import LAGEnv
 
@@ -403,9 +409,9 @@ def make_render_env(env_name, seed, env_args):
         env = GYMEnv(env_args)
         env.seed(seed * 60000)
     elif env_name == "football":
-        from harl.envs.football.football_env import FootballEnv
+        from harl.envs.football.grf_ns import make_football_ns_env
 
-        env = FootballEnv(env_args)
+        env = make_football_ns_env(env_args, 0, 1)
         manual_render = False  # football renders automatically
         env.seed(seed * 60000)
     elif env_name == "dexhands":

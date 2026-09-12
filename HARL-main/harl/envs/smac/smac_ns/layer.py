@@ -56,7 +56,12 @@ import numpy as np
 
 from .coupling import Coupling
 from .driver import GuardDriver
-from .pact1_core import AgentRLS, relative_excess, rls_confidence_pred
+from .pact1_core import (
+    AgentRLS,
+    herd_index,
+    relative_excess,
+    rls_confidence_pred,
+)
 
 N_ACTIONS_NO_ATTACK = 6          # no-op, stop, N, S, E, W -- stock SMAC
 
@@ -130,6 +135,16 @@ class SeverityMixin(object):
         self.ns_n_restored = 0.0
         self.ns_n_steps = 0
         self.ns_n_debug_fail = 0
+        self.ns_n_dial_live = 0
+        self.ns_tot_dealt = 0.0
+        self.ns_tot_wasted = 0.0
+        # II.10's headline pair, on PRIOR (one-step-ahead) predictions and scored
+        # against an intercept-only null.  Raw R^2 is inflated by the per-agent
+        # intercept memorising each agent's typical residual; the LIFT over that
+        # null is what means "the peer channels explained something".
+        self._fg_lam = 0.999
+        self._fg = dict(n=0, sse_full=0.0, sse_null=0.0, sse_fc=0.0, sst=0.0,
+                        ybar=0.0)
         self._ns_banner()
 
     # ------------------------------------------------------------------ gates
@@ -167,15 +182,22 @@ class SeverityMixin(object):
     def _ns_reset_state(self):
         n, K = self.n_agents, self.n_actions
         self.ns_target = np.full(n, -1, dtype=np.int64)
+        self.ns_prev_target = np.full(n, -1, dtype=np.int64)
         self.ns_fired = np.zeros(n)
         self.ns_u = np.zeros(n)
         self.ns_excess = np.zeros(n)
         self.ns_y = np.full(n, np.nan)
         self.ns_psi_prev = np.zeros((n, self.coupling.r + 1))
         self.ns_cost = np.zeros((n, K))          # per-action predicted cost
+        self.ns_cost_prev = np.zeros((n, K))     # last step's, for pred_gain
         self.ns_conf = np.zeros(n)
+        self.ns_pred_full = np.full(n, np.nan)
         self.ns_clip_hits = 0
         self.ns_rows = 0
+        # per-step damage accounting -- the single most diagnostic pair of
+        # numbers for "is the NS actually biting?"
+        self.ns_dmg_dealt = 0.0
+        self.ns_dmg_wasted = 0.0
 
     def reset(self, *args, **kwargs):
         out = super(SeverityMixin, self).reset(*args, **kwargs)
@@ -234,6 +256,13 @@ class SeverityMixin(object):
             psi[:, 1:] = 0.0                 # the `intercept` arm: peer channels off
         for i in range(n):
             if act_m[i] and np.isfinite(y[i]):
+                # SCORE THE PRIOR PREDICTION BEFORE UPDATING ON IT.  Scoring the
+                # posterior fit measures memorisation, not prediction.
+                pf = float(self._rls[i].predict(psi[i]))
+                pn = float(self._rls[i].beta[0])          # intercept-only null
+                pc = float(self.ns_cost_prev[i, int(actions_int[i])])                     if int(actions_int[i]) >= N_ACTIONS_NO_ATTACK else np.nan
+                self.ns_pred_full[i] = pf
+                self._fg_observe(y[i], pf, pn, pc)
                 self._rls[i].update(psi[i][None, :], np.array([y[i]]))
                 self.ns_rows += 1
             self.ns_conf[i] = rls_confidence_pred(
@@ -243,12 +272,67 @@ class SeverityMixin(object):
         # ---- predict the cost of every candidate target, for the steering ----
         self._ns_predict_costs(tgt, alive, fired)
 
+        # ---- what the squad actually did to the enemy line this step --------
+        # self.enemies still holds the PREVIOUS step (update_units has not run),
+        # and self._obs holds the current, so the difference is this step's
+        # realized damage.  Comparing it against the DECLARED per-unit damage is
+        # how we catch an operator whose arithmetic has drifted from the game.
+        self.ns_dmg_dealt = self._ns_measure_damage()
+        self.ns_dmg_wasted = float(np.sum(
+            self.coupling.dmg[fired > 0] * (exc[fired > 0]
+                                            / (1.0 + exc[fired > 0]))))
+        self.ns_tot_dealt += self.ns_dmg_dealt
+        self.ns_tot_wasted += self.ns_dmg_wasted
+
         # ---- apply the harm to the engine -----------------------------------
         if self.ns_on and self.ns_sigma > 0.0:
             self._ns_restore(tgt, alive, fired, exc)
 
+        self.ns_prev_target = tgt.copy()
+        self.ns_cost_prev = self.ns_cost.copy()
+        self.ns_n_dial_live += int(float(np.min(g)) < 1.0)
         self.ns_clock += 1
         self.ns_n_steps += 1
+
+    def _ns_measure_damage(self):
+        """Realized damage on the enemy line this step, from the health deltas."""
+        cur = {}
+        try:
+            for u in self._obs.observation.raw_data.units:
+                cur[u.tag] = float(u.health) + float(u.shield)
+        except Exception:
+            return float("nan")
+        tot = 0.0
+        for e, unit in (getattr(self, "enemies", {}) or {}).items():
+            if unit is None:
+                continue
+            was = float(unit.health) + float(unit.shield)
+            now = cur.get(unit.tag, 0.0)          # absent => died this step
+            if was > now:
+                tot += was - now
+        return tot
+
+    def _fg_observe(self, y, pred_full, pred_null, pred_forecast):
+        """Accumulate II.10's fit_gain / pred_gain on one-step-ahead predictions."""
+        f = self._fg
+        lam = self._fg_lam
+        f["n"] += 1
+        f["ybar"] = lam * f["ybar"] + (1 - lam) * float(y)
+        if f["n"] <= 200:                 # skip a warmup: a cold start otherwise
+            return                        # dominates both sums and their diff
+        f["sse_full"] = lam * f["sse_full"] + (1 - lam) * (y - pred_full) ** 2
+        f["sse_null"] = lam * f["sse_null"] + (1 - lam) * (y - pred_null) ** 2
+        f["sst"] = lam * f["sst"] + (1 - lam) * (y - f["ybar"]) ** 2
+        if np.isfinite(pred_forecast):
+            f["sse_fc"] = lam * f["sse_fc"] + (1 - lam) * (y - pred_forecast) ** 2
+
+    def _fg_value(self, key):
+        """Guarded with NaN, never an epsilon: inside the placebo the target has
+        no variance to explain and the ratio is meaningless."""
+        f = self._fg
+        if f["n"] <= 200 or f["sst"] <= 0.0:
+            return float("nan")
+        return float((f["sse_null"] - f[key]) / f["sst"])
 
     def _ns_predict_costs(self, tgt, alive, fired):
         """``cost_hat[i, k]`` over agent i's candidate ATTACK actions.
@@ -290,8 +374,15 @@ class SeverityMixin(object):
             f = exc[i] / (1.0 + exc[i])              # the part that did not land
             waste[tgt[i]] += self.coupling.dmg[i] * f
         # imported here, not at module scope: I.7's conformance suite must run
-        # with no StarCraft II installed, and it imports this module.
-        from s2clientprotocol import debug_pb2 as d_pb
+        # with no StarCraft II installed, and it imports this module.  A missing
+        # protobuf is counted as a refused harm write rather than raised, so the
+        # run reports "the dial is not reaching the records" (NS-3.2) instead of
+        # dying -- and the runner's [WARN] fires on the very first interval.
+        try:
+            from s2clientprotocol import debug_pb2 as d_pb
+        except ImportError:
+            self.ns_n_debug_fail += 1
+            return
 
         cmds = []
         for e in range(self.n_enemies):
@@ -349,33 +440,134 @@ class SeverityMixin(object):
         sz[0] = int(sz[0]) + self.n_actions
         return sz
 
+    # ------------------------------------------------------------------ step
+    def step(self, actions):
+        """Merge the NS diagnostics into every info dict.
+
+        *** THIS OVERRIDE IS LOAD-BEARING. ***  Without it the layer runs, the
+        harm lands and every ``ns_*`` column in the debug file reads NaN -- which
+        is indistinguishable from "the dial never fired", in exactly the arm you
+        most need to trust.  That is NS-3.3's failure mode arriving through the
+        diagnostics rather than through the physics, and it cost a 440k-step run.
+        """
+        out = super(SeverityMixin, self).step(actions)
+        if not isinstance(out, tuple) or len(out) < 5:
+            return out
+        out = list(out)
+        infos = out[4]
+        d = self.ns_info()
+        try:
+            for i in range(len(infos)):
+                if isinstance(infos[i], dict):
+                    infos[i].update(d)
+                    infos[i]["ns_u_i"] = float(self.ns_u[i])
+                    infos[i]["ns_excess_i"] = float(self.ns_excess[i])
+                    infos[i]["ns_target_i"] = float(self.ns_target[i])
+        except (TypeError, IndexError):
+            pass
+        out[4] = infos
+        return tuple(out)
+
     # ------------------------------------------------------------------ report
     def ns_info(self):
-        """Per-step diagnostics -- II.10's instrument panel."""
+        """II.10's instrument panel, in full.
+
+        The design principle the spec insists on: "is the method working" and "is
+        it winning" live in SEPARATE columns, because the method can work
+        perfectly and still not win, and that is a statement about how much
+        headroom the domain has rather than a bug.
+
+        Every ratio is guarded with NaN, never an epsilon.
+        """
         live = self.ns_fired > 0
         nz = int(live.sum())
+        alive = np.array([1.0 if (self.agents.get(i) is not None
+                                  and self.agents[i].health > 0) else 0.0
+                          for i in range(self.n_agents)])
+
         def m(x):
             v = np.asarray(x, dtype=np.float64)[live] if nz else np.asarray([np.nan])
             v = v[np.isfinite(v)]
             return float(v.mean()) if v.size else float("nan")
+
+        def mx(x):
+            v = np.asarray(x, dtype=np.float64)[live] if nz else np.asarray([np.nan])
+            v = v[np.isfinite(v)]
+            return float(v.max()) if v.size else float("nan")
+
+        g = self.ns_g()
         A = float(self.driver.A(self.ns_clock))
-        return {
-            "ns_A": A,
-            "ns_g": float(np.mean(self.ns_g())),
+        beta = np.mean([r.beta for r in self._rls], axis=0)
+        x = self.ns_psi_prev[:, 1:]
+        # herd index over the fleet's CHOSEN targets -- P-8.1's commons signature.
+        # Logged, never acted on: acting on it would make the method a mechanism
+        # rather than a per-agent estimator and break decentralization (P-4.1).
+        cnt = np.bincount(self.ns_target[self.ns_target >= 0],
+                          minlength=self.n_enemies).astype(np.float64)
+        switched = float(np.mean((self.ns_target != self.ns_prev_target)[live]))             if nz else float("nan")
+        cond = float("nan")
+        try:
+            G = self.ns_psi_prev.T @ self.ns_psi_prev / max(1, self.n_agents)
+            c = float(np.linalg.cond(G))
+            cond = c if np.isfinite(c) else float("inf")
+        except np.linalg.LinAlgError:
+            cond = float("inf")
+
+        info = {
+            # ---- is the DIAL live?  (every arm, baselines included) ----------
             "ns_sigma": float(self.ns_sigma),
+            "ns_on": float(self.ns_on),
+            "ns_A": A,
+            "ns_g": float(np.mean(g)),
+            "ns_g_min": float(np.min(g)),
             "ns_placebo": float(bool(self.driver.is_placebo(self.ns_clock))),
-            "ns_u": m(self.ns_u),
-            "ns_excess": m(self.ns_excess),
-            "ns_y": m(self.ns_y),
-            "ns_conf": float(np.mean(self.ns_conf)),
-            "ns_x_std": float(np.std(self.ns_psi_prev[:, 1:])),
-            "ns_clip_frac": (float(self.ns_clip_hits) / max(1, self.ns_rows)),
-            "ns_rows": float(self.ns_rows),
+            "ns_dial_ratio": (float(self.ns_n_dial_live) / self.ns_n_steps
+                              if self.ns_n_steps else float("nan")),
+            "ns_clock": float(self.ns_clock),
+            # ---- did the harm actually REACH the game? (NS-3.2, NS-3.3) ------
             "ns_harmed": float(self.ns_n_harmed),
             "ns_restored": float(self.ns_n_restored),
             "ns_debug_fail": float(self.ns_n_debug_fail),
-            "ns_fire_frac": float(np.mean(self.ns_fired)),
+            "ns_dmg_dealt": float(self.ns_dmg_dealt),
+            "ns_dmg_wasted": float(self.ns_dmg_wasted),
+            "ns_waste_frac": (self.ns_dmg_wasted / self.ns_dmg_dealt
+                              if self.ns_dmg_dealt > 1e-9 else float("nan")),
+            "ns_waste_frac_cum": (self.ns_tot_wasted / self.ns_tot_dealt
+                                  if self.ns_tot_dealt > 1e-9 else float("nan")),
+            # ---- is the MEDIUM loaded?  (III.1 Q7 -- if not, nothing can bite)
+            "ns_u": m(self.ns_u),
+            "ns_u_max": mx(self.ns_u),
+            "ns_excess": m(self.ns_excess),
+            "ns_excess_max": mx(self.ns_excess),
+            "ns_y": m(self.ns_y),
+            "ns_fire_frac": (float(np.sum(live)) / float(np.sum(alive))
+                             if np.sum(alive) > 0 else float("nan")),
+            "ns_alive": float(np.sum(alive)),
+            "ns_herd_index": float(herd_index(cnt)),
+            "ns_switch_frac": switched,
+            # ---- is the METHOD working?  (kept apart from "is it winning") ---
+            "ns_fit_gain": self._fg_value("sse_full"),
+            "ns_pred_gain": self._fg_value("sse_fc"),
+            "ns_cond_psi": cond,
+            "ns_conf": float(np.mean(self.ns_conf)),
+            "ns_rows": float(self.ns_rows),
+            "ns_clip_frac": (float(self.ns_clip_hits) / max(1, self.ns_rows)),
+            "ns_innov": float(np.mean([r.innov for r in self._rls])),
+            "ns_trP": float(np.mean([np.trace(r.P) for r in self._rls])),
+            "ns_x_std": float(np.std(x)),
+            "ns_x_mean": float(np.mean(x)),
+            "ns_cost_std": float(np.std(self.ns_cost[:, N_ACTIONS_NO_ATTACK:])),
         }
+        # Always emit the full set, NaN-padded.  The schema is then identical
+        # across maps -- 3s5z has r = 2 so ns_beta3 / ns_x2 are honestly NaN,
+        # while 1c3s5z (r = 3) fills them -- and the runner's schema check stays
+        # an exact equality instead of needing a list of optional columns.
+        for k in range(4):
+            info["ns_beta%d" % k] = float(beta[k]) if k < len(beta) else float("nan")
+        for k in range(3):
+            info["ns_x%d" % k] = (float(np.mean(x[:, k])) if k < x.shape[1]
+                                  else float("nan"))
+        return info
 
     def ns_close_report(self):
         """NS-3.3: refuse to describe the run as a severity arm if nothing fired."""

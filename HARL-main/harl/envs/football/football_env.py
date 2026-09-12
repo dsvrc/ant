@@ -11,6 +11,12 @@ env_num_agents = {
     "academy_counterattack_hard": 4,
     "academy_corner": 11,
     "academy_single_goal_versus_lazy": 11,
+    # single-controlled-player scenarios, used by grf_ns/smoke.py for the N = 1
+    # identity (a lone player must read exactly zero lane load at any severity)
+    "academy_empty_goal_close": 1,
+    "academy_empty_goal": 1,
+    "academy_run_to_score": 1,
+    "academy_run_to_score_with_keeper": 1,
 }
 
 

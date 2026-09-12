@@ -1,4 +1,11 @@
-env_name: academy_pass_and_shoot_with_keeper
+# Google Research Football -- HARL host config + the GRF-NS severity layer.
+#
+# The host task.  academy_3_vs_1_with_keeper is the canonical SOLVED academy
+# scenario: stock MAPPO/HAPPO reach ~90% win rate on it (tuned_configs/football/
+# academy_3_vs_1_with_keeper).  That is the point: the dial has something to take
+# away, so when the stock algorithms fall under the non-stationarity and the
+# compensated arm does not, the difference is the method and not the task.
+env_name: academy_3_vs_1_with_keeper
 stacked: False
 representation: simple115v2
 rewards: scoring,checkpoints
@@ -9,7 +16,7 @@ write_video: False
 dump_frequency: 1
 logdir: ~
 extra_players: ~
-number_of_left_players_agent_controls: 2 # has to be consistent with the default setting below
+number_of_left_players_agent_controls: 3 # has to be consistent with env_num_agents below
 number_of_right_players_agent_controls: 0
 channel_dimensions:
   - 96
@@ -23,3 +30,105 @@ other_config_options: ~
 #   "academy_counterattack_hard": 4,
 #   "academy_corner": 11,
 #   "academy_single_goal_versus_lazy": 11
+
+# =============================================================================
+#  GRF-NS -- Coupling Under Drift, cell (C, INVERTIBLE).   harl/envs/football/grf_ns/
+# =============================================================================
+#
+#  THE STORY.  Every clause below is a requirement, not colour.
+#
+#    Three attackers share one half of a pitch.  A player running with a
+#    teammate in his lane has to go round him: he swerves off the line he
+#    wanted.  How early and how wide he swerves depends on the footing -- on a
+#    firm dry surface he checks and cuts late; on a wet, greasy, cutting-up
+#    pitch he cannot check, so he gives everyone more room, earlier.  The
+#    surface changes over the match and nobody on the pitch controls it.  A
+#    player ALONE in that half never swerves round anyone, however wet it is.
+#
+#    interaction-mediated  the swerve is caused by TEAMMATES in the lane; the
+#                          sum is over j != i, so a lone player reads exactly
+#                          zero at every severity          (gate 3, asserted)
+#    exogenous             pitch condition over the match: a function of the
+#                          clock alone; the answer a footballer gives unprompted
+#                          to "what makes this harder some days?"
+#    never a reward term   it removes capability (a few degrees of heading);
+#                          GRF's scoring+checkpoints reward is untouched
+#    invertible            aiming off is what players do on a bad surface, and
+#                          the eight headings form a group -- exact inverse, no
+#                          saturation -- so a correct estimate CANCELS it
+#    the classes are real  a teammate AHEAD costs more than one on the FLANK;
+#                          one BEHIND is not in the lane.  Which sector he is in
+#                          is public geometry; what he costs you TODAY is not.
+#
+#  THE DIAL IS TASK PHYSICS (NS-3.1): it lives here, in the task config, so every
+#  algorithm in the repo -- mappo, happo, hatrpo, ... -- runs inside the identical
+#  physics.  Only the PACT-family runners add the compensator, and they do it by
+#  setting ns_pact / ns_trust / ns_oracle / ns_intercept_only (never edit those
+#  here).  `--ns_on 0` gives stock GRF byte for byte for a B0 reference run.
+#
+#  ANCHOR, STATED HONESTLY (NS-2.4).  Football has no published constant for
+#  "how much wider you swerve on a wet pitch", so sigma = 1 is a stated
+#  calibration procedure, NOT an anchor: at sigma = 1, at the driver's peak, with
+#  the squad at the scenario's own spawn geometry and every player under way,
+#  the swerve reaching a player is 0.14 of one 45-degree compass step per step.
+#  0.14 is carried over from the HCM heavy-rain factor only so the ladders of the
+#  instances share a scale.  Every sigma > 1 is a BEYOND-PHYSICAL stress test and
+#  is labelled so wherever it appears.
+#
+#  COMMITTED OPERATING POINT.  ns_severity below is a PLACEHOLDER until
+#  calibrate.py has been run against a trained B0 policy; commit the chosen row
+#  and the ladder it came from here:
+#
+#    sigma   blind   pact   oracle   intercept   corr_clipped   (win rate, 3 seeds)
+#    0       ....    ....   ....     ....        ....           <- fill from calibrate.py
+#    1       ....    ....   ....     ....        ....
+#    2       ....    ....   ....     ....        ....
+#    3       ....    ....   ....     ....        ....
+#
+#  Choose the smallest sigma at which the blind arm has lost a clear margin and
+#  the oracle still recovers B0 -- the row then measures the METHOD, not the
+#  environment.  Also commit ns_load_norm from the same output so every process
+#  and every arm uses the identical number.
+
+ns_on: 1                 # 1 = the layer is in; 0 = stock GRF (B0)
+ns_severity: 1.0         # sigma.  EXACTLY inert at 0.0.  PLACEHOLDER -- see above.
+
+# -- the driver: A(t), a sin^2 bump that is EXACTLY zero for the dry half ------
+ns_period: 12000         # ~100 typical episodes: the surface drifts ACROSS episodes, like URB's day
+ns_wet_fraction: 0.5     # the rest of the cycle is the placebo (NS-2.5)
+ns_loss_at_sigma1: 0.14  # the stated calibration target, see above
+ns_mean_preserving: 0    # NS-5.1 variant: same total swerve per cycle at every sigma
+ns_phase0: 0             # clock origin; rollout threads are de-phased from it
+
+# -- the medium and the declared classes ----------------------------------------
+ns_rho: 0.6              # lane memory: a swerve is committed to over a few steps
+ns_kernel_lambda: 0.12   # lane length scale, pitch units (~6 m); kappa = 1/(1+(d/lam)^2)
+ns_recv_ball: 1.5        # the ball carrier swerves widest (dribbling needs room)
+ns_send_front: 1.4       # beta* per sector, normalised to mean 1.  UNKNOWN to the
+ns_send_flank: 0.6       #   agent; what the estimator recovers.
+ns_y_clip: 10.0          # P-2.1 declared sensor bound; clip_frac is reported
+ns_corr_clip: 1.0        # relief valve: never aim off more than one compass step/step
+ns_load_norm: 0.223152   # COMMITTED from ceiling.py for academy_3_vs_1_with_keeper (spawn geometry);
+                         #   the layer warns if the running scenario disagrees by >1%
+
+# -- the (B) control ----------------------------------------------------------------
+ns_direct: 0             # 1 = the same swerve reaches everyone directly (a lone
+                         #     player feels it).  The pair (0 vs 1) is the experiment
+                         #     the (B)/(C) classification rests on.
+
+# -- the compensator.  SET BY THE PACT-FAMILY RUNNERS, never here. ----------------
+ns_pact: 0               # runner sets 1
+ns_trust: "off"          # QUOTED: bare `off` is YAML for False.  runner sets "off" | "fixed"
+                         #   (learned is not implementable on an action-space inverse: P-6.2)
+ns_g_fixed: 0.9          # P-5.1 inverted prior, gated by prediction confidence
+ns_oracle: 0             # runner sets 1 for the ceiling arm
+ns_intercept_only: 0     # runner sets 1 for the (B)-vs-(C) probe
+ns_mu: 0.99              # RLS forgetting, a 100-step memory: averages the sigma-delta
+                         #   quantisation noise, tracks the 6000-step bump with ~10% lag.
+                         #   Sweep {0.98, 0.99, 0.995} on prediction error, never on return.
+ns_p0: 10.0
+ns_warmup: 50            # rows per agent before trust engages
+ns_p_trace_max: 100.0    # covariance windup bound (trap 7); 0 disables
+
+# -- ablation: hand every arm's policy its own residual (obs +1) ---------------------
+ns_observe_residual: 0

@@ -34,6 +34,7 @@ from harl.runners.on_policy_pact_ns_runner import (
     PactNsOracleRunner,
     PactNsRunner,
 )
+from harl.runners.on_policy_grf_ns_runner import GRF_ARMS
 
 
 # PACT-1 on SMAC-NS (Coupling Under Drift).  Five arms through the IDENTICAL
@@ -55,16 +56,32 @@ def _pact_runner(args, algo_args, env_args):
     """`--algo pact` dispatches by env.  All three subclass a stock HAPPO runner
     and train bit-identically; only the diagnostics differ.
 
-      smac     -> Formation Congestion + the compensator (harl/envs/smac/fc/),
-                  writing fc_debug.csv.
+      smac     -> SMAC-NS (harl/envs/smac/smac_ns/), the steering channel.
+      football -> GRF-NS (harl/envs/football/grf_ns/), the exact-inverse channel.
       smacv2   -> the legacy coupled-weapon-overheat runner.
       mamujoco -> the continuous PACT runner.
     """
     if args["env"] == "smac":
         return PactNsRunner(args, algo_args, env_args)
+    if args["env"] == "football":
+        return GRF_ARMS["pact"](args, algo_args, env_args)
     if args["env"] == "smacv2":
         return OnPolicyPactSmacRunner(args, algo_args, env_args)
     return OnPolicyPactRunner(args, algo_args, env_args)
+
+
+def _by_env(name):
+    """The PACT-family arm names are shared between SMAC-NS and GRF-NS; the env
+    decides which instance runs.  Same arm semantics, same yaml, different
+    channel -- which is the point of holding the method fixed across cells."""
+    smac_cls = _PACT_NS[name]
+
+    def _make(args, algo_args, env_args):
+        if args["env"] == "football":
+            return GRF_ARMS[name](args, algo_args, env_args)
+        return smac_cls(args, algo_args, env_args)
+
+    return _make
 
 
 RUNNER_REGISTRY = {
@@ -109,12 +126,12 @@ RUNNER_REGISTRY = {
     # the arithmetic exactness gate.  Dispatched by env: mamujoco (continuous, learned
     # beta) vs smac/smacv2 (discrete soft variant, obs-augmentation, gate-only).
     "pact": _pact_runner,
-    "pactoff": _PACT_NS["pactoff"],
-    "pact_fixed": _PACT_NS["pact_fixed"],
-    "pact_oracle": _PACT_NS["pact_oracle"],
-    "pact_intercept": _PACT_NS["pact_intercept"],
-    "pact_happo": _PACT_NS["pact_happo"],
-    "pact_happo_off": _PACT_NS["pact_happo_off"],
+    "pactoff": _by_env("pactoff"),
+    "pact_fixed": _by_env("pact_fixed"),
+    "pact_oracle": _by_env("pact_oracle"),
+    "pact_intercept": _by_env("pact_intercept"),
+    "pact_happo": _by_env("pact_happo"),
+    "pact_happo_off": _by_env("pact_happo_off"),
 
     # PACT-1: same dispatch. The wrapper emits the same pact_* info keys the runner
     # already reads, so pact_debug.csv works unchanged -- except the gate now
