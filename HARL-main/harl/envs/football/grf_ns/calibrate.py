@@ -64,11 +64,18 @@ def load_run(run_dir):
     return cfg["main_args"]["algo"], cfg["algo_args"], cfg["env_args"], model_dir
 
 
-def make_vec(env_args, n_threads, phase, seed, peak):
+def make_vec(env_args, n_threads, phase, seed, peak, engine_seed=True):
     fns = []
     for rank in range(n_threads):
         def fn(rank=rank):
             ea = dict(env_args)
+            if engine_seed:
+                # env.seed() is a no-op in gfootball (measured); this is what
+                # makes an engine instance reproducible.  Every ARM gets the same
+                # per-thread streams, so the ladder is a paired comparison.
+                opt = dict(ea.get("other_config_options") or {})
+                opt["game_engine_random_seed"] = int(seed * 50000 + rank * 10000)
+                ea["other_config_options"] = opt
             if phase == "peak":
                 ea["ns_phase0"] = int(peak)
                 env = make_football_ns_env(ea, 0, 1)
@@ -153,6 +160,8 @@ def main():
     ap.add_argument("--phase", choices=["peak", "cycle"], default="peak")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--cuda", type=int, default=1)
+    ap.add_argument("--engine_seed", type=int, default=1,
+                    help="1 = reproducible engine streams shared across arms (paired ladder)")
     ap.add_argument("--out", default="")
     a = ap.parse_args()
 
@@ -184,7 +193,7 @@ def main():
                 # place where corr_clip binding shows sigma*
                 ea["ns_g_fixed"] = 1.0
             t0 = time.time()
-            envs = make_vec(ea, a.threads, a.phase, a.seed, peak)
+            envs = make_vec(ea, a.threads, a.phase, a.seed, peak, bool(a.engine_seed))
             if actors is None:
                 n_agents = int(envs.n_agents)
                 actors = build_actors(algo, algo_args, envs, n_agents, device, model_dir)
@@ -201,7 +210,7 @@ def main():
     print("\nTHE LADDER (win rate of the frozen B0 policy; sigma > 1 is BEYOND-PHYSICAL)")
     hdr = "  %-6s" % "sigma" + "".join("%12s" % arm for arm in arms) + "%14s" % "corr_clipped"
     print(hdr)
-    b0 = table.get((0.0, "blind"), table.get((sigmas[0], "blind")))["win"]
+    b0 = table[(sigmas[0], "blind")]["win"] if "blind" in arms else float("nan")
     rec = None
     for s in sigmas:
         row = "  %-6g" % s + "".join("%12.3f" % table[(s, arm)]["win"] for arm in arms)

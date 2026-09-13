@@ -151,10 +151,14 @@ python examples/train.py --algo mappo --env football --exp_name b0 --ns_on 0 --s
 **4. Calibrate σ against B0, then commit the operating point.**
 
 ```bash
-python -m harl.envs.football.grf_ns.calibrate --run_dir results/football/academy_3_vs_1_with_keeper/mappo/b0/seed-00001-<stamp> --sigmas 0,0.5,1,2,3 --episodes 100 --threads 10 --phase peak --out ladder.json
+python -m harl.envs.football.grf_ns.calibrate --run_dir results/football/academy_3_vs_1_with_keeper/mappo/b0/seed-00001-<stamp> --sigmas 0,0.25,0.5,1,1.5,2,3 --episodes 100 --threads 10 --phase peak --out ladder_peak.json
 ```
 
-Commit the chosen `ns_severity` and the table into `football.yaml`.
+Run it once more with `--phase cycle --out ladder_cycle.json` (the cycle average is
+what training sees).  `calibrate.py` gives every thread a fixed
+`game_engine_random_seed` shared across arms, so the ladder is a paired
+comparison (`env.seed()` is a no-op in gfootball).  Commit the chosen
+`ns_severity` and the table into `football.yaml`.
 
 **5. The arms.** Five, through the identical layer (P-9.1). `blind` is
 `--algo mappo` inside the dial; `pactoff` is provably bit-identical to it and

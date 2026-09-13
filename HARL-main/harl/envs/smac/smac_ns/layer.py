@@ -307,13 +307,18 @@ class SeverityMixin(object):
         self.ns_g_now = None
 
     def reset(self, *args, **kwargs):
-        out = super(SeverityMixin, self).reset(*args, **kwargs)
         # NS-3.4: the clock is NOT reset.  The guard cycle does not restart
         # because a training episode ended, any more than weather does.  The
         # per-episode buffers are cleared; the ESTIMATOR persists too, because
         # beta* drifts far more slowly than an episode lasts.
+        #
+        # Cleared BEFORE the host resets: StarCraft2Env builds the episode's first
+        # observation inside its own reset(), and that observation carries the
+        # predicted-cost tail.  Cleared after, the first decision of every episode
+        # was steered by the last episode's predictions for units that no longer
+        # exist.
         self._ns_reset_state()
-        return out
+        return super(SeverityMixin, self).reset(*args, **kwargs)
 
     # ------------------------------------------------------------------ driver
     def ns_g(self):

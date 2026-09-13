@@ -83,10 +83,11 @@ def _pcr_eval_env_args(env_args, rank, n_threads):
 
 
 def make_smac_env(env_args, rank=0, n_threads=1, seed=None):
-    """Build a SMAC env with the Coupling-Under-Drift severity layer mixed in.
+    """Build a SMAC env with the LANE SWERVE severity layer mixed in.
 
-        StarCraft2Env                 stock, one no-op hook
-          +-- SmacNsEnv(mixin, ..)    the dial.  EVERY arm gets it (NS-3.1).
+        StarCraft2Env                   stock
+          +-- SmacLaneEnv(mixin, ..)    the dial (and, in the PACT arms, the
+                                        compensator).  EVERY arm gets it (NS-3.1).
 
     The dial is read from the TASK config, never from a method's block, so a
     baseline and the method run inside identical physics and only the trust term
@@ -109,9 +110,9 @@ def make_smac_env(env_args, rank=0, n_threads=1, seed=None):
 
         env = StarCraft2Env(a)
     else:
-        from harl.envs.smac.smac_ns import make_smac_ns_env
+        from harl.envs.smac.smac_lane import make_smac_lane_env
 
-        env = make_smac_ns_env(a)
+        env = make_smac_lane_env(a)
     if seed is not None:
         env.seed(seed)
     return env

@@ -62,7 +62,7 @@ def main():
     stock = build(False)
     off = build(True, pact_n_actions=K, pact_trust="off")
     pact = build(True, pact_n_actions=K, pact_trust="learned", pact_steer_from=FROM,
-                 pact_steer_floor=FLOOR)
+                 pact_steer_floor=FLOOR, pact_channel="zscore")
 
     B = 64
     rng = np.random.RandomState(3)
@@ -100,7 +100,7 @@ def main():
     first = np.zeros((B, K), dtype=np.float32)
     first[:, FROM:] = 0.0027 + 0.0007 * rng.randn(B, K - FROM)   # its measured costs
     buggy = build(True, pact_n_actions=K, pact_trust="learned", pact_steer_from=0,
-                  pact_steer_floor=0.0)
+                  pact_steer_floor=0.0, pact_channel="zscore")
     lb, lh = logits(buggy, first), logits(stock, None)
     d = (lb - lh)
     # compare the LOG-ODDS of attacking vs moving, which normalisation cannot hide
@@ -136,23 +136,32 @@ def main():
           abs(rel_mean) < 1e-4, "mean attack shift vs moves %+.2e (z has mean 0)"
           % rel_mean)
     g = float(torch.sigmoid(torch.tensor(2.2)))
-    worst, n_open, n_shut, shut_exact = 0.0, 0, 0, True
-    for b in range(B):
-        valid = np.zeros(K, bool)
-        valid[FROM:] = avail[b, FROM:] > 0
-        ref = steer(np.zeros(K), live[b].astype(np.float64), g, 1.0, valid, FLOOR)
-        got = (dd[b] - dd[b, 1]).numpy().astype(np.float64)
-        worst = max(worst, float(np.max(np.abs((got - ref)[valid]))))
-        if np.all(ref == 0.0):
-            n_shut += 1
-            shut_exact &= bool(torch.equal(lp[b], lh[b]))
-        else:
-            n_open += 1
-    check("actor_shift_equals_channel_steer_row_by_row",
-          worst < 1e-4 and n_open > 0 and n_shut > 0,
-          "max|torch - numpy| %.2e over %d open and %d gated rows"
-          % (worst, n_open, n_shut))
-    check("gated_rows_are_the_host_bit_for_bit", shut_exact)
+    for channel in ("zscore", "logratio"):
+        model = pact if channel == "zscore" else build(
+            True, pact_n_actions=K, pact_trust="learned", pact_steer_from=FROM,
+            pact_steer_floor=FLOOR, pact_channel=channel)
+        lpc = logits(model, live)
+        ddc = lpc - lh
+        worst, n_open, n_shut, shut_exact = 0.0, 0, 0, True
+        for b in range(B):
+            valid = np.zeros(K, bool)
+            valid[FROM:] = avail[b, FROM:] > 0
+            ref = steer(np.zeros(K), live[b].astype(np.float64), g, 1.0, valid,
+                        FLOOR, channel)
+            got = (ddc[b] - ddc[b, 1]).numpy().astype(np.float64)
+            worst = max(worst, float(np.max(np.abs((got - ref)[valid]))))
+            if np.all(ref == 0.0):
+                n_shut += 1
+                shut_exact &= bool(torch.equal(lpc[b], lh[b]))
+            else:
+                n_open += 1
+        check("%s_actor_shift_equals_channel_steer_row_by_row" % channel,
+              worst < 1e-4 and n_open > 0 and n_shut > 0,
+              "max|torch - numpy| %.2e over %d open and %d gated rows"
+              % (worst, n_open, n_shut))
+        check("%s_gated_rows_are_the_host_bit_for_bit" % channel, shut_exact)
+        mvc = float((ddc[:, 1:FROM] - ddc[:, 1:2]).abs().max())
+        check("%s_never_reorders_a_move_against_a_move" % channel, mvc < 1e-5)
 
     flat = np.zeros((B, K), dtype=np.float32)
     flat[:, FROM:] = 0.0031                        # identical predictions
@@ -172,13 +181,14 @@ def main():
           "d logp / d w = %.4g" % (float(gw.sum()) if gw is not None else float("nan")))
 
     fixed = build(True, pact_n_actions=K, pact_trust="fixed", pact_steer_from=FROM,
-                  pact_steer_floor=FLOOR)
+                  pact_steer_floor=FLOOR, pact_channel="logratio")
     check("fixed_arm_creates_no_trust_parameter", fixed.pact_w is None)
 
     for missing, why in (("pact_steer_from", "z-scores moves against attacks"),
-                         ("pact_steer_floor", "steers on a residual in the placebo")):
+                         ("pact_steer_floor", "steers on a residual in the placebo"),
+                         ("pact_channel", "picks a shift nobody declared")):
         kw = dict(pact_n_actions=K, pact_trust="learned", pact_steer_from=FROM,
-                  pact_steer_floor=FLOOR)
+                  pact_steer_floor=FLOOR, pact_channel="logratio")
         kw.pop(missing)
         raised = False
         try:

@@ -17,14 +17,25 @@ harm goes through here so that cannot pass silently again.
 
 import numpy as np
 
-from .coupling import UNIT_STATS
+from .coupling import ALLY, ENEMY, UNIT_STATS
+
+#: SMAC's own episode limits for the maps the offline harness can build (smac_maps
+#: imports pysc2, which is not installed offline)
+LIMIT = {"3s5z": 150, "2s3z": 120, "8m": 120, "3s5z_vs_3s6z": 170,
+         "10m_vs_11m": 150, "27m_vs_30m": 180, "1c3s5z": 180, "MMM2": 180}
+
+
+class Pos(object):
+    def __init__(self, x=0.0, y=0.0):
+        self.x, self.y = float(x), float(y)
 
 
 class Unit(object):
-    """The three fields of ``raw_pb.Unit`` the layer reads.  Mutable, as protos are."""
+    """The fields of ``raw_pb.Unit`` the layers read.  Mutable, as protos are."""
 
-    def __init__(self, tag, health, shield):
+    def __init__(self, tag, health, shield, pos=None):
         self.tag, self.health, self.shield = int(tag), float(health), float(shield)
+        self.pos = pos if pos is not None else Pos()
 
 
 class Obs(object):
@@ -39,15 +50,16 @@ class Obs(object):
 
 
 class BattleHost(object):
-    """Just enough host for ``SeverityMixin``: the 3s5z shape and unit tables.
+    """Just enough host for ``SeverityMixin``: a map's roster shape and limit.
 
     Like StarCraft2Env it calls its own virtuals during construction, so the
     mixin's construction-order guard is exercised here too."""
 
     def __init__(self, args, **kwargs):
         self.map_name = args["map_name"]
-        self.n_agents, self.n_enemies = 8, 8
-        self.episode_limit, self._step_mul = 150, 8
+        self.n_agents = len(ALLY[self.map_name])
+        self.n_enemies = len(ENEMY[self.map_name])
+        self.episode_limit, self._step_mul = LIMIT[self.map_name], 8
         self.n_actions_no_attack = 6
         self.n_actions = self.n_actions_no_attack + self.n_enemies
         self._controller = None
@@ -89,9 +101,9 @@ def tick(env, ally_acts, ally_dmg, enemy_tgt=None, enemy_dmg=None):
     ally enemy k shoots, or -1.  Damage is simultaneous; the dead drop out of the
     observation exactly as SC2 drops them from ``raw_data.units``.
     """
-    post_en = {k: Unit(u.tag, u.health, u.shield)
+    post_en = {k: Unit(u.tag, u.health, u.shield, u.pos)
                for k, u in env.enemies.items() if u is not None and u.health > 0}
-    post_al = {i: Unit(u.tag, u.health, u.shield)
+    post_al = {i: Unit(u.tag, u.health, u.shield, u.pos)
                for i, u in env.agents.items() if u is not None and u.health > 0}
     inc_en, inc_al = {}, {}
     for i, a in enumerate(ally_acts):
@@ -118,7 +130,7 @@ def update_units(env):
             if u is None:
                 continue
             now = by_tag.get(u.tag, None)
-            d[k] = now if now is not None else Unit(u.tag, 0.0, u.shield)
+            d[k] = now if now is not None else Unit(u.tag, 0.0, u.shield, u.pos)
 
 
 def step(env, ally_acts, ally_dmg, enemy_tgt=None, enemy_dmg=None):

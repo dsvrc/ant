@@ -104,6 +104,16 @@ class StochasticPolicy(nn.Module):
                 "placebo is z-scored into a full-size shift.  The runner must pass "
                 "the declared floor (env ns_steer_floor).")
         self.pact_floor = float(self.pact_floor or 0.0)
+        # which dimensionless shift (smac_ns/channel.py): "zscore" is the reference
+        # instance's, verbatim; "logratio" reweights each option by (1+excess)^-g.
+        # Required: on a focus-fire task the two behave oppositely (channel.py).
+        self.pact_channel = args.get("pact_channel", None)
+        if self.pact_k > 0 and self.pact_mode != "off":
+            if self.pact_channel not in ("zscore", "logratio"):
+                raise ValueError(
+                    "pact_channel must be 'zscore' or 'logratio', got %r.  The runner "
+                    "passes the declared channel (env ns_channel)."
+                    % (self.pact_channel,))
         if self.pact_k > 0 and self.pact_mode == "learned":
             self.pact_w = nn.Parameter(torch.zeros(1))
         else:
@@ -123,7 +133,9 @@ class StochasticPolicy(nn.Module):
         return obs[..., : -self.pact_k], obs[..., -self.pact_k:]
 
     def _pact_bias(self, cost, available_actions):
-        """``-g * kappa * z`` -- the shift of II.6, as a logit bias.
+        """``-g * kappa * unit`` -- the shift of II.6, as a logit bias, where unit is
+        the z-score (``pact_channel: zscore``) or the centred log(1 + cost)
+        (``logratio``) over the valid options.
 
         The z-score is taken over the agent's VALID options only, which is what
         makes ``kappa`` a single declared constant instead of a per-instance scale
@@ -158,8 +170,13 @@ class StochasticPolicy(nn.Module):
         var = (((cost - mean) ** 2) * m).sum(-1, keepdim=True) / n.clamp(min=1.0)
         sd = var.clamp(min=0.0).sqrt()
         open_ = (sd > 1e-12) & (sd >= self.pact_floor) & (n > 1.5)  # <2 options: none
-        z = torch.where(open_, (cost - mean) / sd.clamp(min=1e-12),
-                        torch.zeros_like(cost))
+        if self.pact_channel == "logratio":
+            lc = torch.log1p(cost.clamp(min=-0.99))
+            lmean = (lc * m).sum(-1, keepdim=True) / n.clamp(min=1.0)
+            unit = lc - lmean
+        else:
+            unit = (cost - mean) / sd.clamp(min=1e-12)
+        z = torch.where(open_, unit, torch.zeros_like(cost))
         return -(g * self.pact_kappa) * z * m
 
     def forward(

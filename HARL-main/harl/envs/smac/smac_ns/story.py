@@ -81,10 +81,10 @@ def _first_run_restore(self, tgt, fired, exc, post, landed):
     return restored
 
 
-def _host_logits(hp, focus=FOCUS):
+def _host_logits(hp, focus=FOCUS, scale=160.0):
     lg = np.full(A0 + len(hp), -np.inf)
     alive = hp > 0
-    att = -focus * hp[alive] / 160.0
+    att = -focus * hp[alive] / scale
     lg[A0:][alive] = att
     m = att.max()
     lse = m + np.log(np.exp(att - m).sum())
@@ -93,8 +93,9 @@ def _host_logits(hp, focus=FOCUS):
 
 
 def run(job):
-    config, arm, sigma, seed, cycles, focus = job
-    kw = dict(map_name="3s5z", ns_severity=float(sigma), ns_augment=1,
+    config, arm, sigma, seed, cycles, focus, channel = job[:7]
+    map_name = job[7] if len(job) > 7 else "3s5z"
+    kw = dict(map_name=map_name, ns_severity=float(sigma), ns_augment=1,
               ns_oracle=int(arm == "oracle"), ns_seed=0)
     if config == "first":
         kw.update(ns_cap_mode="max", ns_period=150, ns_steer_floor=0.0)
@@ -102,11 +103,19 @@ def run(job):
         e = _Env(kw)
     if config == "first":
         e._ns_restore = _first_run_restore.__get__(e, _Env)
+    if config == "prekill":
+        # the harm is applied INSIDE the tick instead (below), so the layer must not
+        # hand anything back afterwards -- it still senses, estimates and predicts
+        e._ns_restore = lambda *a, **k: np.zeros(e.n_enemies)
     rng = np.random.RandomState(1000 + seed)
     period = e.driver.period
-    # identical clock horizon for both configs, so warmup is comparable
-    horizon = int(cycles * 15000)
-    warm = 15000
+    # identical clock horizon for both configs, so warmup is comparable: whole
+    # cycles of the SHIPPED period (100 episode limits of this map)
+    cyc = 100 * e.episode_limit
+    horizon = int(cycles * cyc)
+    warm = cyc
+    hp_scale = float(max(UNIT_STATS[x]["life"] + UNIT_STATS[x]["shield"]
+                         for x in e.coupling.enemy_names))
     a_dmg = e.coupling.dmg
     e_dmg = step_damage(e.coupling.enemy_names, e._step_mul)
     K = A0 + e.n_enemies
@@ -132,7 +141,7 @@ def run(job):
             if not al_alive[i]:
                 acts.append(0)
                 continue
-            lg = _host_logits(hp_e, focus)
+            lg = _host_logits(hp_e, focus, hp_scale)
             avail = np.isfinite(lg)
             if arm != "blind":
                 if config == "first":
@@ -141,7 +150,8 @@ def run(job):
                     valid = avail & (idx >= A0)      # attackable options only
                 # the policy's channel, floor included (0 for the first run)
                 lg = np.where(avail, steer(np.where(avail, lg, 0.0), e.ns_cost[i],
-                                           TRUST, 1.0, valid, e.ns_steer_floor),
+                                           TRUST, 1.0, valid, e.ns_steer_floor,
+                                           "zscore" if config == "first" else channel),
                               -np.inf)
             p = np.exp(lg - lg[avail].max())
             p = p / p.sum()
@@ -153,7 +163,22 @@ def run(job):
                 alive_idx = np.where(al_alive)[0]
                 enemy_tgt[k] = int(rng.choice(alive_idx)) if alive_idx.size else -1
         shoots = (hp_e > 0) & (rng.rand(e.n_enemies) >= P_STOP)
-        toy.tick(e, acts, a_dmg, np.where(shoots, enemy_tgt, -1), e_dmg)
+        step_dmg = a_dmg
+        if config == "prekill":
+            # the DESIGNED physics with no kill exemption: each shot lands
+            # dmg * (1 - f), f = excess/(1+excess), before hit points resolve --
+            # so a volley the guard should blunt can fail to kill
+            tg = np.array([a - A0 if (al_alive[i] and a >= A0) else -1
+                           for i, a in enumerate(acts)])
+            fr = (tg >= 0).astype(float)
+            u_pre = e.coupling.loading(tg, al_alive.astype(float), fr,
+                                       np.ones(e.n_enemies), cap=hp_e)
+            gnow = e.ns_g()
+            exc_pre = e.coupling.excess(u_pre, np.array([gnow[t] if t >= 0 else 1.0
+                                                         for t in tg]))
+            step_dmg = a_dmg * (1.0 - exc_pre / (1.0 + exc_pre))
+            e._prekill_waste = float(np.sum((a_dmg - step_dmg)[fr > 0]))
+        toy.tick(e, acts, step_dmg, np.where(shoots, enemy_tgt, -1), e_dmg)
         e._ns_hook(acts)
         toy.update_units(e)
 
@@ -167,7 +192,8 @@ def run(job):
                 a = acc[key]
                 if np.isfinite(e.ns_dmg_dealt):
                     a["landed"] += e.ns_dmg_dealt
-                a["restored"] += e.ns_dmg_wasted
+                a["restored"] += (getattr(e, "_prekill_waste", 0.0)
+                                  if config == "prekill" else e.ns_dmg_wasted)
                 a["design"] += e.ns_dmg_harm_design
                 a["gated"] += e.ns_step_gated
                 a["gate_n"] += e.ns_step_gate_n
@@ -184,7 +210,7 @@ def run(job):
                     acc[key]["lens"] += t_ep
             enemy_tgt = new_battle()
             t_ep, A_sum, wet = 0, 0.0, 0
-    return (config, arm, sigma, seed, focus), acc
+    return (config, arm, sigma, seed, focus, channel, map_name), acc
 
 
 def main(argv=None):
@@ -194,7 +220,12 @@ def main(argv=None):
     ap.add_argument("--cycles", type=int, default=4)
     ap.add_argument("--workers", type=int, default=14)
     ap.add_argument("--no-first", action="store_true")
+    ap.add_argument("--config", default="fixed", choices=["fixed", "prekill"],
+                    help="prekill: the designed harm lands before hit points "
+                         "resolve, so killing blows are harmed too")
     ap.add_argument("--arms", nargs="+", default=["blind", "pact", "oracle"])
+    ap.add_argument("--channel", default="zscore", choices=["zscore", "logratio"])
+    ap.add_argument("--map", default="3s5z")
     ap.add_argument("--focus", type=float, default=FOCUS,
                     help="host preference for the weakest target (logit per 160 hp)")
     a = ap.parse_args(argv)
@@ -203,15 +234,29 @@ def main(argv=None):
     for s in a.sigmas:
         for seed in a.seeds:
             for arm in a.arms:
-                jobs.append(("fixed", arm, s, seed, a.cycles, a.focus))
+                jobs.append((a.config, arm, s, seed, a.cycles, a.focus, a.channel,
+                             a.map))
             if not a.no_first and s in (0.0, 1.0):
                 for arm in [x for x in a.arms if x != "oracle"]:
-                    jobs.append(("first", arm, s, seed, a.cycles, a.focus))
+                    jobs.append(("first", arm, s, seed, a.cycles, a.focus,
+                                 a.channel, a.map))
+    out = []
     with Pool(min(a.workers, len(jobs))) as pool:
-        out = pool.map(run, jobs)
+        # one line per finished job, so an interrupted sweep still leaves data
+        for (key, acc) in pool.imap_unordered(run, jobs):
+            out.append((key, acc))
+            pk, dr, al = acc["peak"], acc["dry"], acc["all"]
+            print("[job %2d/%d] %-5s %-6s sigma=%.1f seed=%d  win_all=%.3f (n=%d) "
+                  "win_peak=%s win_dry=%s harm_peak=%s"
+                  % (len(out), len(jobs), key[0], key[1], key[2], key[3],
+                     al["wins"] / max(1, al["n"]), al["n"],
+                     "%.3f" % (pk["wins"] / pk["n"]) if pk["n"] else "nan",
+                     "%.3f" % (dr["wins"] / dr["n"]) if dr["n"] else "nan",
+                     "%.4f" % (pk["restored"] / pk["landed"]) if pk["landed"] else "nan"),
+                  flush=True)
 
     pooled = {}
-    for (config, arm, sigma, seed, _f), acc in out:
+    for (config, arm, sigma, seed, _f, _c, _m), acc in out:
         key = (config, sigma, arm)
         if key not in pooled:
             pooled[key] = {p: dict(v) for p, v in acc.items()}
@@ -225,25 +270,26 @@ def main(argv=None):
 
     print("=" * 108)
     print("STORY TEST -- Lanchester 3s5z, fixed focus-fire host, the REAL layer "
-          "(%d seeds x %d cycles, first cycle dropped, focus %.1f)"
-          % (len(a.seeds), a.cycles, a.focus))
+          "(%s, %d seeds x %d cycles, first cycle dropped, focus %.1f, channel %s)"
+          % (a.map, len(a.seeds), a.cycles, a.focus, a.channel))
     print("=" * 108)
-    print("%-6s %-5s %-7s | %-8s %-8s %-6s | %-9s %-9s %-9s | %-9s %-9s | %s"
-          % ("config", "sigma", "arm", "win_peak", "win_dry", "gap", "harm_peak",
-             "harm_all", "delivery", "gate_peak", "gate_dry", "episodes pk/dry"))
-    for key in sorted(pooled, key=lambda k: (k[0] != "first", k[1],
+    print("%-6s %-5s %-7s | %-7s %-8s %-8s %-6s | %-9s %-9s %-9s | %-9s %-9s | %s"
+          % ("config", "sigma", "arm", "win_all", "win_peak", "win_dry", "gap",
+             "harm_peak", "harm_all", "delivery", "gate_peak", "gate_dry",
+             "episodes pk/dry/all"))
+    for key in sorted(pooled, key=lambda k: (k[0] != "first", k[0], k[1],
                                             ("blind", "pact", "oracle").index(k[2]))):
         config, sigma, arm = key
         pk, dr, al = pooled[key]["peak"], pooled[key]["dry"], pooled[key]["all"]
         wp, wd = rate(pk, "wins", "n"), rate(dr, "wins", "n")
-        print("%-6s %-5.1f %-7s | %-8.3f %-8.3f %-6.3f | %-9.4f %-9.4f %-9.3f | "
-              "%-9s %-9s | %d/%d"
-              % (config, sigma, arm, wp, wd, wd - wp,
+        print("%-6s %-5.1f %-7s | %-7.3f %-8.3f %-8.3f %-6.3f | %-9.4f %-9.4f %-9.3f | "
+              "%-9s %-9s | %d/%d/%d"
+              % (config, sigma, arm, rate(al, "wins", "n"), wp, wd, wd - wp,
                  rate(pk, "restored", "landed"), rate(al, "restored", "landed"),
                  rate(al, "restored", "design"),
                  "-" if arm == "blind" else "%.2f" % rate(pk, "gated", "gate_n"),
                  "-" if arm == "blind" else "%.2f" % rate(dr, "gated", "gate_n"),
-                 pk["n"], dr["n"]))
+                 pk["n"], dr["n"], al["n"]))
     print("-" * 108)
     print("gap = win_dry - win_peak: what the guard phase costs this host.  "
           "harm = restored / landed.\n"

@@ -361,6 +361,35 @@ def t_first_run_fixes():
           % float(tiny[6:].std()))
     wide = np.zeros(14)
     wide[6:] = rng.uniform(0.0, 0.2, 8)
+    # the log-ratio channel: proportional to what is wasted, dimensionless, inert
+    lr = steer(lg, wide, 0.9, 1.0, valid, 0.0, "logratio")
+    d = lr - lg
+    cheapest, dearest = 6 + int(np.argmin(wide[6:])), 6 + int(np.argmax(wide[6:]))
+    check("logratio_direction_and_zero_mean",
+          d[cheapest] > 0 > d[dearest] and abs(float(d[6:].mean())) < 1e-12
+          and np.all(d[:6] == 0.0),
+          "cheapest +%.3f, dearest %.3f, mean over attacks %.1e, moves untouched"
+          % (d[cheapest], d[dearest], float(d[6:].mean())))
+    two = np.zeros(14)
+    two[7] = 1.0                                   # one option wastes half its damage
+    v2 = np.zeros(14, bool)
+    v2[6:8] = True
+    r2 = steer(np.zeros(14), two, 0.9, 1.0, v2, 0.0, "logratio")
+    odds = float(np.exp(r2[7] - r2[6]))
+    check("logratio_reweights_odds_by_one_plus_excess_to_the_minus_g",
+          abs(odds - 2.0 ** -0.9) < 1e-12,
+          "excess 1.0 keeps %.4f of its odds (2^-0.9 = %.4f)" % (odds, 2.0 ** -0.9))
+    small = np.zeros(14)
+    small[6:] = rng.uniform(0.0, 0.02, 8)
+    zs = float(np.max(np.abs(steer(lg, small, 0.9, 1.0, valid, 0.0, "zscore") - lg)))
+    ls = float(np.max(np.abs(steer(lg, small, 0.9, 1.0, valid, 0.0, "logratio") - lg)))
+    check("a_1pct_difference_is_a_full_shove_in_zscore_and_a_nudge_in_logratio",
+          zs > 1.0 and ls < 0.02,
+          "max logit move: zscore %.2f, logratio %.4f" % (zs, ls))
+    check("logratio_is_exact_at_g_zero_and_on_identical_predictions",
+          np.array_equal(steer(lg, wide, 0.0, 1.0, valid, 0.0, "logratio"), lg)
+          and np.array_equal(steer(lg, np.full(14, 0.3), 0.9, 1.0, valid, 0.0,
+                                   "logratio"), lg))
     check("above_the_floor_the_shift_is_the_core_steer_logits",
           np.array_equal(steer(lg, wide, 0.85, 1.0, valid, 0.01),
                          steer_logits(lg, wide, 0.85, 1.0, valid)),
@@ -527,6 +556,33 @@ def t_hook():
     e, out = _unit_env(ns_period=150)
     check("first_run_period_is_flagged_not_trackable", "NOT-TRACKABLE" in out,
           "period 150 against a >= 1000-step memory")
+
+    # the host builds the first observation INSIDE reset(); its tail must be flat
+    from . import toy as _toy
+    from .layer import SeverityMixin as _Mix
+
+    class _ObsHost(_toy.BattleHost):
+        def get_obs_agent(self, agent_id):
+            return np.zeros(3, dtype=np.float32)
+
+        def reset(self):
+            return [self.get_obs_agent(i) for i in range(self.n_agents)]
+
+    class _EnvR(_Mix, _ObsHost):
+        pass
+
+    import contextlib as _cl
+    import io as _io
+    with _cl.redirect_stdout(_io.StringIO()):
+        er = _EnvR({"map_name": MAP, "ns_severity": 5.0, "ns_augment": 1,
+                    "ns_phase0": 15000 // 4})
+    er.agents = _toy.fresh(er.coupling.ally_names, 0)
+    er.enemies = _toy.fresh(er.coupling.enemy_names, 100)
+    er.ns_cost[:, 6:] = np.arange(8, dtype=np.float64)     # a non-flat last tail
+    first = er.reset()
+    check("first_observation_of_an_episode_carries_no_stale_tail",
+          all(float(np.max(np.abs(o[3:]))) == 0.0 for o in first),
+          "the tail is cleared before the host builds the observation")
 
     # ---- the restore, against the engine order ------------------------------
     from . import layer as lyr
