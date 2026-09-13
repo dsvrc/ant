@@ -95,9 +95,15 @@ def make_smac_env(env_args, rank=0, n_threads=1, seed=None):
     a = dict(env_args)
     if n_threads > 1:
         # De-phase the guard clock across workers so a rollout batch is a true
-        # cycle average rather than one phase of it.
+        # cycle average rather than one phase of it.  The fallback period must be
+        # the layer's own default (100 episode limits), or the workers bunch up.
+        period = a.get("ns_period", None)
+        if period is None:
+            from harl.envs.smac.smac_maps import get_map_params
+
+            period = 100 * int(get_map_params(a["map_name"])["limit"])
         a["ns_phase0"] = int(a.get("ns_phase0", 0)) + int(
-            rank * int(a.get("ns_period", 150)) / max(1, n_threads))
+            rank * int(period) / max(1, n_threads))
     if not int(a.get("ns_on", 1)):
         from harl.envs.smac.StarCraft2_Env import StarCraft2Env
 

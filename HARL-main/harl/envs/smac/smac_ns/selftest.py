@@ -253,7 +253,7 @@ class _StubHost(object):
         self.n_actions = self.n_actions_no_attack + self.n_enemies
         self._controller = None
         self.agents = {i: None for i in range(self.n_agents)}
-        self.enemies = {i: None for i in range(self.n_enemies)}
+        self.enemies = {i: None for i in range(self.n_enemies)}   # filled per step
         # the two host calls that reach our overrides mid-construction
         self.observation_space = [self.get_obs_size() for _ in range(self.n_agents)]
         self._probe_obs = self.get_obs_agent(0)
@@ -299,6 +299,336 @@ def t_mixin():
           "no tail when ns_augment = 0, so mappo/happo run on stock SMAC obs")
 
 
+# ================================================================ first-run fixes
+def t_first_run_fixes():
+    """Each check reproduces a failure the first 3.2M-step run measured."""
+    print("first-run fixes  (A: live capacity, B: steering floor)")
+    rng = np.random.RandomState(21)
+    cmax = Coupling(MAP, NA, NE, cap_mode="max")
+    crem = Coupling(MAP, NA, NE, cap_mode="remaining")
+
+    # A1: remaining capacity must still give EXACT category C and EXACT identity
+    c1 = Coupling(MAP, 1, NE, cap_mode="remaining")
+    u1 = c1.loading(np.array([0]), np.array([1.0]), np.array([1.0]), np.ones(NE),
+                    cap=np.full(NE, 3.0))          # a nearly dead target
+    h1 = 1.0 + float(c1.excess(u1, np.array([1e-3]))[0])
+    check("remaining_capacity_keeps_lone_agent_harm_exactly_one", h1 == 1.0,
+          "harm = %.9f against a 3-hp target at g = 1e-3" % h1)
+    tg, al, f = _rand(rng)
+    cap = rng.uniform(5.0, 150.0, NE)
+    u = crem.loading(tg, al, f, np.ones(NE), cap=cap)
+    e0 = crem.excess(u, np.ones(NA))
+    check("remaining_capacity_keeps_identity_at_zero_exact",
+          float(np.max(np.abs(e0))) == 0.0, "excess == 0 EXACTLY at g == 1")
+
+    # A2: the fix actually loads the medium.  A focus-fired target losing hit
+    # points must read a far higher u than the same volley against a full bar.
+    focus = np.zeros(NA, dtype=np.int64)
+    fire = np.ones(NA)
+    full = cmax.loading(focus, np.ones(NA), fire, np.ones(NE))
+    low = crem.loading(focus, np.ones(NA), fire, np.ones(NE),
+                       cap=np.r_[20.0, np.full(NE - 1, 150.0)])
+    check("remaining_capacity_loads_a_dying_target",
+          float(low.mean()) > 5.0 * float(full.mean()),
+          "u %.3f against a full bar -> %.3f against 20 hp remaining"
+          % (full.mean(), low.mean()))
+    check("loading_is_bounded_for_the_regressor",
+          float(crem.loading(focus, np.ones(NA), fire, np.ones(NE),
+                             cap=np.full(NE, 1e-6)).max()) <= Coupling.U_CLIP,
+          "u never exceeds U_CLIP = %.1f however little hp is left" % Coupling.U_CLIP)
+    v = crem.channels(tg, al, f, cap=cap)
+    b = crem.channels_bruteforce(tg, al, f, cap=cap)
+    check("vectorised_basis_equals_brute_force_under_live_capacity",
+          float(np.max(np.abs(v - b))) < 1e-12,
+          "max|diff| = %.3g" % float(np.max(np.abs(v - b))))
+
+    # B: the floor.  The first run's ranking -- a spread of 0.0007 -- is scale-
+    # free to the z-score, so it moves a logit as hard as a 10% difference would.
+    lg = np.arange(14, dtype=np.float64)
+    valid = np.zeros(14, bool)
+    valid[6:] = True
+    tiny = np.zeros(14)
+    tiny[6:] = 0.0027 + rng.randn(8) * 0.0007
+    shifted = steer_logits(lg, tiny, 0.85, 1.0, valid)
+    check("zscore_turns_a_0.0007_spread_into_a_full_logit_shove",
+          float(np.max(np.abs(shifted - lg))) > 0.5,
+          "spread %.4f still moved a logit by %.2f -- why a floor is needed"
+          % (float(tiny[6:].std()), float(np.max(np.abs(shifted - lg)))))
+    from .channel import steer
+    check("below_the_floor_the_host_logits_are_bit_for_bit",
+          np.array_equal(steer(lg, tiny, 0.85, 1.0, valid, 0.01), lg),
+          "spread %.4f < floor 0.01 -> shift exactly zero (P-7.1 extended)"
+          % float(tiny[6:].std()))
+    wide = np.zeros(14)
+    wide[6:] = rng.uniform(0.0, 0.2, 8)
+    check("above_the_floor_the_shift_is_the_core_steer_logits",
+          np.array_equal(steer(lg, wide, 0.85, 1.0, valid, 0.01),
+                         steer_logits(lg, wide, 0.85, 1.0, valid)),
+          "spread %.3f >= floor: pact1_core, verbatim" % float(wide[6:].std()))
+
+    # the channel's units make the reduction EXACT: excess = (1/g - 1) * s(u)
+    uu = np.concatenate([[0.0], rng.uniform(0.0, Coupling.U_CLIP, 400)])
+    gg = rng.uniform(0.05, 1.0, uu.size)
+    lhs = crem.excess(uu, gg)
+    rhs = (1.0 / gg - 1.0) * crem._share(uu)
+    check("reduction_is_exact_in_share_units",
+          float(np.max(np.abs(lhs - rhs))) < 1e-12 and float(crem._share(0.0)) == 0.0,
+          "max|excess - (1/g-1) s(u)| = %.1e over u in [0, %.0f]"
+          % (float(np.max(np.abs(lhs - rhs))), Coupling.U_CLIP))
+    # ... so RLS on (y, psi) identifies the driver factor itself, per class
+    est = AgentRLS(crem.r + 1, mu=1.0, p0=10.0)
+    g_true = np.array([0.8, 0.6])                       # per class
+    for _ in range(3000):
+        tg, al, f = _rand(rng)
+        cap = rng.uniform(5.0, 150.0, NE)
+        u = crem.loading(tg, al, f, np.ones(NE), cap=cap)
+        ps = crem.psi(tg, al, f, cap=cap)
+        for i in np.where(f > 0)[0]:
+            gc = g_true[crem.cls_of[tg[i]]]
+            est.update(ps[i][None, :], np.array([float(crem.excess(u[i], gc))]))
+    b = est.beta[1:] / crem.x_scale                     # back to per-unit-share slope
+    # exact model, so the only error left is the p0 prior's finite-sample bias
+    check("rls_on_share_channels_recovers_one_over_g_minus_one",
+          float(np.max(np.abs(b - (1.0 / g_true - 1.0)))) < 1e-4,
+          "slope per class %s, truth %s" % (np.round(b, 6),
+                                            np.round(1.0 / g_true - 1.0, 6)))
+
+    # one-pass option basis == the per-agent definition (GATE 1b, offline copy)
+    worst_p = worst_u = 0.0
+    for _ in range(50):
+        tg, al, f = _rand(rng)
+        al = (rng.rand(NA) < 0.9).astype(float)
+        cap = rng.uniform(0.0, 200.0, NE)
+        for cp in (None, cap):
+            allp = crem.psi_all_options(tg, al, f, cap=cp)
+            allu = crem.loading_all_options(tg, al, f, cap=cp)
+            for i in range(NA):
+                ref = crem.psi_options(i, tg, al, f, np.arange(NE), cap=cp)
+                worst_p = max(worst_p, float(np.max(np.abs(allp[i] - ref))))
+                for k in range(NE):
+                    ex = tg.copy()
+                    ex[i] = k
+                    want = crem.loading(ex, al, f, np.ones(NE), cap=cp)[i]
+                    worst_u = max(worst_u, abs(float(allu[i, k]) - float(want)))
+    check("one_pass_option_basis_equals_per_agent_definition",
+          worst_p < 1e-12 and worst_u < 1e-9,
+          "basis max|diff| %.2g, loading max|diff| %.2g" % (worst_p, worst_u))
+
+
+# ================================================================ the hook itself
+def _unit_env(**kw):
+    """The REAL layer over a unit-holding host, stepped in the ENGINE'S ORDER
+    (toy.step: tick -> hook -> update_units).  The first version of these tests
+    never called the hook, and a crash in ``ns_cap_mode: max`` shipped; the second
+    applied harm after the hook, which is not what SC2 does, and could not see that
+    the restore was undoing whole steps of damage."""
+    import contextlib
+    import io
+
+    from . import toy
+    from .layer import SeverityMixin
+
+    class _Env(SeverityMixin, toy.BattleHost):
+        pass
+
+    args = {"map_name": MAP, "ns_severity": 3.0, "ns_augment": 1}
+    args.update(kw)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        e = _Env(args)
+    e.agents = toy.fresh(e.coupling.ally_names, 0)
+    e.enemies = toy.fresh(e.coupling.enemy_names, 100)
+    return e, buf.getvalue()
+
+
+def _focus_steps(e, n_steps, rng, record=None):
+    """Focus the weakest enemy with most of the squad, through the engine order."""
+    from . import toy
+
+    for _ in range(n_steps):
+        hp = e._ns_live_hp()
+        alive = np.where(hp > 0)[0]
+        if alive.size == 0:
+            e.enemies = toy.fresh(e.coupling.enemy_names, 100 + 10 * e.ns_n_steps)
+            e._ns_reset_state()
+            continue
+        weak = int(alive[np.argmin(hp[alive])])
+        acts = [6 + (weak if rng.rand() < 0.7 else int(rng.choice(alive)))
+                if rng.rand() < 0.8 else 1 for _ in range(NA)]
+        pre = {k: (u.health, u.shield) for k, u in e.enemies.items()}
+        toy.tick(e, acts, e.coupling.dmg)
+        post_raw = {u.tag: (u.health, u.shield)
+                    for u in e._obs.observation.raw_data.units}
+        e._ns_hook(acts)
+        if record is not None:
+            snap = {u.tag: (u.health, u.shield)
+                    for u in e._obs.observation.raw_data.units}
+            record.append((pre, post_raw, snap, dict((k, u.tag)
+                                                     for k, u in e.enemies.items())))
+        toy.update_units(e)
+
+
+def t_hook():
+    print("the hook, end to end  (both capacity modes, every arm's cost path)")
+    rng = np.random.RandomState(5)
+    for mode in ("remaining", "max"):
+        ok, why = True, ""
+        try:
+            e, _ = _unit_env(ns_cap_mode=mode)
+            _focus_steps(e, 40, rng)
+            info = e.ns_info()
+        except Exception as exc:
+            ok, why, info = False, "%s: %s" % (type(exc).__name__, exc), {}
+        check("hook_runs_end_to_end_with_cap_mode_%s" % mode, ok,
+              why or "40 focus-fire steps, %d ns_* keys" % len(info))
+
+    e, _ = _unit_env(ns_oracle=1)
+    ok, why = True, ""
+    try:
+        _focus_steps(e, 20, rng)
+    except Exception as exc:
+        ok, why = False, "%s: %s" % (type(exc).__name__, exc)
+    check("oracle_arm_cost_path_runs", ok, why or "true excess per option, one pass")
+
+    # NS-3.4: the info row describes the step the harm was computed FOR
+    e, _ = _unit_env()
+    _focus_steps(e, 3, rng)
+    info = e.ns_info()
+    check("info_latches_the_step_the_harm_was_computed_for",
+          info["ns_clock"] == float(e.ns_clock - 1)
+          and info["ns_A"] == float(e.driver.A(e.ns_clock - 1)),
+          "info clock %d, counter now %d" % (int(info["ns_clock"]), e.ns_clock))
+
+    # P-7.1 at sigma = 0: y is identically zero, beta_hat never leaves 0, every
+    # decision is gated and the actor sees a flat tail -- the arm IS the host
+    e, _ = _unit_env(ns_severity=0.0)
+    _focus_steps(e, 300, rng)
+    tail = e.ns_cost[:, 6:]
+    check("sigma_zero_every_steering_decision_is_flat",
+          e.ns_gated == e.ns_gate_n and e.ns_gate_n > 0
+          and float(np.max(np.abs(tail - tail[:, :1]))) == 0.0,
+          "%d/%d gated, attack tail exactly flat" % (e.ns_gated, e.ns_gate_n))
+
+    # the knob that gated a well-identified ranking must not be silently accepted
+    raised = False
+    try:
+        _unit_env(ns_snr_min=1.0)
+    except ValueError:
+        raised = True
+    check("removed_ns_snr_min_refuses_to_build", raised,
+          "compared the spread with one row's error; replaced by ns_steer_floor")
+
+    e, out = _unit_env()
+    check("default_period_is_100_episode_limits",
+          e.driver.period == 100 * e.episode_limit
+          and "NOT-TRACKABLE" not in out,
+          "period %d steps, estimator memory >= %d steps"
+          % (e.driver.period, int(round(1.0 / (1.0 - e.ns_mu)))))
+    e, out = _unit_env(ns_period=150)
+    check("first_run_period_is_flagged_not_trackable", "NOT-TRACKABLE" in out,
+          "period 150 against a >= 1000-step memory")
+
+    # ---- the restore, against the engine order ------------------------------
+    from . import layer as lyr
+    from . import toy
+
+    # hold the guard at its peak so every step can harm
+    e, _ = _unit_env(ns_severity=5.0, ns_phase0=15000 // 4)
+    rec = []
+    _focus_steps(e, 400, np.random.RandomState(11), record=rec)
+    over, leak, revived, n_rest = 0.0, 0.0, 0, 0
+    for pre, post_raw, snap, tags in rec:
+        for k, tag in tags.items():
+            if pre[k][0] <= 0:
+                continue
+            was = pre[k][0] + pre[k][1]
+            if tag not in post_raw:
+                revived += int(tag in snap)            # a killed unit came back?
+                continue
+            landed = max(0.0, was - sum(post_raw[tag]))
+            gain = sum(snap[tag]) - sum(post_raw[tag])
+            n_rest += int(gain > 1e-9)
+            over = max(over, gain - landed)
+            leak = max(leak, sum(snap[tag]) - was)     # net change must stay >= 0
+    check("restore_never_exceeds_the_damage_that_landed",
+          over <= 1e-9 and n_rest > 0,
+          "%d restores, worst restore-minus-landed %.2e" % (n_rest, over))
+    check("net_hit_point_change_of_every_enemy_stays_non_negative",
+          leak <= 1e-9,
+          "stock reward_battle takes abs() of it -- healing would be paid as damage")
+    check("a_unit_killed_this_step_is_never_restored", revived == 0)
+
+    # the first version's arithmetic, reproduced: pre-tick shields 30, the tick
+    # takes 20, a 25% wasted fraction must hand back 5 -- ending at 15, not 35
+    e, _ = _unit_env(ns_severity=5.0, ns_phase0=15000 // 4)
+    e.enemies[0] = toy.Unit(100, 80.0, 30.0)
+    post = {0: toy.Unit(100, 80.0, 10.0)}
+    tg = np.full(NA, -1)
+    tg[:2] = 0
+    exc = np.zeros(NA)
+    exc[:2] = 1.0 / 3.0                                  # f = 0.25 for both shooters
+    landed = np.zeros(NE)
+    landed[0] = 20.0
+    got = e._ns_restore(tg, (tg >= 0).astype(float), exc, post, landed)
+    check("restore_adds_to_the_post_tick_bar_not_the_pre_tick_one",
+          abs(post[0].shield - 15.0) < 1e-9 and abs(float(got[0]) - 5.0) < 1e-9,
+          "shields 30 -> tick 10 -> restored %.1f (the first version wrote 35)"
+          % post[0].shield)
+
+    # snapshot and engine agree: capture the debug commands through a fake engine
+    class _Pb(object):
+        class DebugSetUnitValue(object):
+            Shields, Life = "Shields", "Life"
+
+            def __init__(self, unit_value, value, unit_tag):
+                self.unit_value, self.value, self.unit_tag = unit_value, value, unit_tag
+
+        class DebugCommand(object):
+            def __init__(self, unit_value):
+                self.unit_value = unit_value
+
+    class _Ctl(object):
+        def __init__(self):
+            self.sent = []
+
+        def debug(self, cmds):
+            self.sent.extend(cmds)
+
+    saved = list(lyr._PB)
+    lyr._PB[:] = [_Pb]
+    try:
+        e, _ = _unit_env(ns_severity=5.0, ns_phase0=15000 // 4)
+        e._controller = _Ctl()
+        worst = 0.0
+        n_cmd = 0
+        rng2 = np.random.RandomState(12)
+        for _ in range(200):
+            e._controller.sent = []
+            hp = e._ns_live_hp()
+            alive = np.where(hp > 0)[0]
+            if alive.size == 0:
+                e.enemies = toy.fresh(e.coupling.enemy_names, 1000 + e.ns_n_steps)
+                e._ns_reset_state()
+                continue
+            weak = int(alive[np.argmin(hp[alive])])
+            acts = [6 + weak if rng2.rand() < 0.8 else 1 for _ in range(NA)]
+            toy.tick(e, acts, e.coupling.dmg)
+            e._ns_hook(acts)
+            snap = {u.tag: u for u in e._obs.observation.raw_data.units}
+            for c in e._controller.sent:
+                v = c.unit_value
+                u = snap[v.unit_tag]
+                want = u.shield if v.unit_value == "Shields" else u.health
+                worst = max(worst, abs(v.value - want))
+                n_cmd += 1
+            toy.update_units(e)
+    finally:
+        lyr._PB[:] = saved
+    check("engine_write_equals_the_snapshot_the_reward_reads",
+          n_cmd > 0 and worst <= 1e-9,
+          "%d debug writes, worst |engine - snapshot| %.1e" % (n_cmd, worst))
+
+
 def main():
     print("=" * 78)
     print("SMAC-NS conformance suite -- offline, no StarCraft II")
@@ -309,6 +639,8 @@ def main():
     t_ceiling(c, d)
     t_estimator(c)
     t_mixin()
+    t_first_run_fixes()
+    t_hook()
     print("=" * 78)
     if FAILS:
         print("FAILED %d check(s): %s" % (len(FAILS), ", ".join(FAILS)))

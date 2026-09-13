@@ -77,6 +77,33 @@ class StochasticPolicy(nn.Module):
         self.pact_gmax = float(args.get("pact_g_max", 1.0))
         self.pact_bias = float(args.get("pact_trust_bias", 2.2))
         self.pact_gfixed = float(args.get("pact_g_fixed", 0.9))
+        # The first option the steering may touch.  In SMAC the tail carries a
+        # prediction for the ATTACK options only; stop/move rows are zero because
+        # there is no peer load to predict for them, not because they are free.
+        # Letting those zeros into the z-score reorders every move against every
+        # attack -- the first 3.2M-step run did exactly that: attack costs ~0.003
+        # against moves at 0 put each move ~+0.8 logits and each attack ~-1.0
+        # logits, an anti-attack prior of ~1.8 logits on a map won by focus fire.
+        # Required, never defaulted: a silent fallback to "all options" is that bug.
+        self.pact_from = args.get("pact_steer_from", None)
+        if self.pact_k > 0 and self.pact_mode != "off" and self.pact_from is None:
+            raise ValueError(
+                "pact_steer_from is not set: the steering would z-score move "
+                "actions (cost 0, no prediction) against attack actions.  The "
+                "runner must pass the index of the first steerable option.")
+        self.pact_from = int(self.pact_from or 0)
+        # The floor (smac_ns/channel.py): below this spread of predicted cost over
+        # the valid options the shift is exactly zero.  Applied HERE, where the
+        # option mask the z-score uses is known -- SMAC masks attacks to enemies in
+        # range.  Required for the same reason as pact_steer_from: a silent 0 is
+        # the first run's placebo steering.
+        self.pact_floor = args.get("pact_steer_floor", None)
+        if self.pact_k > 0 and self.pact_mode != "off" and self.pact_floor is None:
+            raise ValueError(
+                "pact_steer_floor is not set: without it a residual estimate in the "
+                "placebo is z-scored into a full-size shift.  The runner must pass "
+                "the declared floor (env ns_steer_floor).")
+        self.pact_floor = float(self.pact_floor or 0.0)
         if self.pact_k > 0 and self.pact_mode == "learned":
             self.pact_w = nn.Parameter(torch.zeros(1))
         else:
@@ -106,6 +133,12 @@ class StochasticPolicy(nn.Module):
         logits are used bit for bit however wrong the estimate is.  The same holds
         when every predicted cost is identical, where the shift is defined to be
         zero rather than NaN.
+
+        The statistics run over options that are BOTH available and steerable
+        (index >= ``pact_steer_from``); every other logit gets exactly zero shift,
+        which is ``valid`` in pact1_core.steer_logits.  Below ``pact_steer_floor``
+        spread the shift is exactly zero too -- ``smac_ns.channel.steer``, which
+        ``check_actor.py`` holds this to.
         """
         if cost is None or self.pact_mode == "off":
             return None
@@ -113,15 +146,20 @@ class StochasticPolicy(nn.Module):
             g = self.pact_gfixed * self.pact_gmax
         else:
             g = self.pact_gmax * torch.sigmoid(self.pact_w + self.pact_bias)
-        m = (available_actions > 0).float() if available_actions is not None             else torch.ones_like(cost)
+        m = ((available_actions > 0).float() if available_actions is not None
+             else torch.ones_like(cost))
+        if self.pact_from > 0:
+            steerable = (torch.arange(cost.shape[-1], device=cost.device)
+                         >= self.pact_from).float()
+            m = m * steerable
         # never let a masked option enter the statistics
         n = m.sum(-1, keepdim=True)
         mean = (cost * m).sum(-1, keepdim=True) / n.clamp(min=1.0)
         var = (((cost - mean) ** 2) * m).sum(-1, keepdim=True) / n.clamp(min=1.0)
         sd = var.clamp(min=0.0).sqrt()
-        z = torch.where(sd > 1e-12, (cost - mean) / sd.clamp(min=1e-12),
+        open_ = (sd > 1e-12) & (sd >= self.pact_floor) & (n > 1.5)  # <2 options: none
+        z = torch.where(open_, (cost - mean) / sd.clamp(min=1e-12),
                         torch.zeros_like(cost))
-        z = torch.where(n > 1.5, z, torch.zeros_like(z))    # <2 options: no shift
         return -(g * self.pact_kappa) * z * m
 
     def forward(

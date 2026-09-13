@@ -128,12 +128,33 @@ class Coupling(object):
                    by the stated one-line procedure, never turned toward a curve.
     """
 
-    def __init__(self, map_name, n_agents, n_enemies, step_mul=8, alpha=2.28):
+    #: The loading is bounded for the REGRESSOR only.  Near a kill the remaining
+    #: capacity goes to zero and u diverges; the harm itself saturates on its own
+    #: at (1/g - 1), so this clip never changes the physics, only keeps the design
+    #: matrix finite.  Declared, reported, never tuned.
+    U_CLIP = 5.0
+
+    def __init__(self, map_name, n_agents, n_enemies, step_mul=8, alpha=2.28,
+                 cap_mode="remaining"):
         self.map_name = str(map_name)
         self.n = int(n_agents)
         self.m = int(n_enemies)
         self.step_mul = int(step_mul)
         self.alpha = float(alpha)
+        # "remaining": capacity is the target's CURRENT effective hit points.
+        # "max":       its published maximum (the first run's definition).
+        #
+        # WHY REMAINING.  Overkill is measured against what is LEFT, not against a
+        # full bar: nobody overkills a zealot at 150 hp, everybody overkills one at
+        # 12.  Against the published maximum, one step of peer damage is a sliver
+        # of the bar, so the medium read u = 0.027 on the first 3.2M-step run --
+        # an order below URB's measured 0.219 -- and the dial took 0.25% of damage.
+        # Against remaining hit points the same fights read u ~ 0.42, inside URB's
+        # regime, with no constant changed.  The capacity is still a published unit
+        # field read off the game each step, never fitted; the operator's
+        # STRUCTURE (incidence, classes, published per-unit damage) stays declared.
+        assert cap_mode in ("remaining", "max"), cap_mode
+        self.cap_mode = cap_mode
         self.ally_names = roster(self.map_name, self.n, "ally")
         self.enemy_names = roster(self.map_name, self.m, "enemy")
         self.cap = effective_hp(self.enemy_names)                    # (m,)
@@ -165,12 +186,46 @@ class Coupling(object):
         self.x_ref = np.zeros(self.r)
         for k, c in enumerate(self.keep):
             cap_c = float(self.cap[self.cls_of == c].mean())
-            self.x_ref[k] = (self.n - 1) * self.dmg_ref / (max(1, self.m) * cap_c)
+            if self.cap_mode == "remaining":
+                # A target's remaining capacity runs from full to empty over its
+                # life, so its declared EXPECTED capacity is half the maximum.
+                # Structure only -- still no run data enters the centring (P-3.3).
+                cap_c *= 0.5
+            u_ref = (self.n - 1) * self.dmg_ref / (max(1, self.m) * cap_c)
+            self.x_ref[k] = float(self._share(u_ref))
         # scale so the centred regressor is O(1): divide by the reference itself.
         self.x_scale = np.maximum(self.x_ref, 1e-12)
 
+    def _share(self, u):
+        """The channel's units: the PEER-INDUCED SHARE of an agent's nominal cost,
+
+            s(u) = (f(u) - 1) / f(u) = alpha*u / (1 + alpha*u),    in [0, 1)
+
+        -- the fraction of what a shot costs at nominal capacity that is overkill
+        caused by the others on the same target.  Why not u itself: the harm is
+
+            excess = f(u/g)/f(u) - 1 = (1/g - 1) * s(u)
+
+        EXACTLY, so in these units the reduction y = beta . psi is exact and beta
+        identifies the driver factor (1/g - 1) directly.  In u it is linear only
+        for alpha*u << 1.  URB's links sit at u ~ 0.22, where that nearly holds;
+        a focus-fired target with a sliver of hit points sits at u ~ 1..5, where
+        the line through a saturating curve flattened every predicted difference
+        between targets below the steering floor while the oracle's stayed above
+        it.  s(0) = 0, so a lone agent still reads exactly zero (P-3.1)."""
+        a = self.alpha * np.asarray(u, dtype=np.float64)
+        return a / (1.0 + a)
+
     # ------------------------------------------------------------------ basis
-    def channels(self, targets, alive, fired, exclude=None):
+    def _capvec(self, cap):
+        """Capacity per element this step: the declared maximum when ``cap`` is
+        None, else the observed remaining hit points, floored at 1 so a near-dead
+        target cannot divide by zero."""
+        if cap is None:
+            return self.cap
+        return np.maximum(np.asarray(cap, dtype=np.float64).reshape(self.m), 1.0)
+
+    def channels(self, targets, alive, fired, exclude=None, cap=None):
         """``x[i, k]`` -- the peer load on class k landing on agent i's own target.
 
         ``targets`` (n,)  index of the enemy each agent is shooting, or -1
@@ -190,6 +245,7 @@ class Coupling(object):
         w = (np.asarray(alive, dtype=np.float64)
              * np.asarray(fired, dtype=np.float64) * self.dmg)        # (n,) load
         mine = t if exclude is None else np.asarray(exclude, dtype=np.int64)
+        capv = self._capvec(cap)
 
         # total damage aimed at each element, then subtract the agent's own so the
         # sum is over j != i without an O(n^2) loop.
@@ -204,10 +260,10 @@ class Coupling(object):
             c = int(self.cls_of[e])
             if c in set(self.keep.tolist()):
                 k = int(np.where(self.keep == c)[0][0])
-                out[i, k] = peer / max(1e-12, self.cap[e])
+                out[i, k] = self._share(min(peer / max(1e-12, capv[e]), self.U_CLIP))
         return (out - self.x_ref[None, :]) / self.x_scale[None, :]
 
-    def channels_bruteforce(self, targets, alive, fired, exclude=None):
+    def channels_bruteforce(self, targets, alive, fired, exclude=None, cap=None):
         """The same thing written straight off the definition, for P-3.2.
 
         Index order and self-exclusion are exactly the kind of wiring bug that
@@ -218,6 +274,7 @@ class Coupling(object):
         a = np.asarray(alive, dtype=np.float64)
         f = np.asarray(fired, dtype=np.float64)
         mine = t if exclude is None else np.asarray(exclude, dtype=np.int64)
+        capv = self._capvec(cap)
         out = np.zeros((self.n, self.r))
         for i in range(self.n):
             e = int(mine[i])
@@ -233,15 +290,16 @@ class Coupling(object):
                     continue                                   # STRICTLY j != i
                 if int(t[j]) == e:
                     s += a[j] * f[j] * self.dmg[j]
-            out[i, k] = s / max(1e-12, self.cap[e])
+            u = min(s / max(1e-12, capv[e]), self.U_CLIP)
+            out[i, k] = self.alpha * u / (1.0 + self.alpha * u)   # s(u), written out
         return (out - self.x_ref[None, :]) / self.x_scale[None, :]
 
-    def psi(self, targets, alive, fired, exclude=None):
+    def psi(self, targets, alive, fired, exclude=None, cap=None):
         """``psi_i = [1, x_1, ..., x_r]`` -- the regressor rows, (n, r+1)."""
-        x = self.channels(targets, alive, fired, exclude)
+        x = self.channels(targets, alive, fired, exclude, cap)
         return np.concatenate([np.ones((self.n, 1)), x], axis=1)
 
-    def psi_options(self, i, targets, alive, fired, options):
+    def psi_options(self, i, targets, alive, fired, options, cap=None):
         """``psi`` for ONE agent over its K candidate targets, (K, r+1).
 
         This is what the steering channel ranks.  Agent i's own contribution is
@@ -252,11 +310,46 @@ class Coupling(object):
         for k in options:
             ex = np.array(targets, dtype=np.int64).copy()
             ex[i] = int(k)
-            rows.append(self.psi(targets, alive, fired, exclude=ex)[i])
+            rows.append(self.psi(targets, alive, fired, exclude=ex, cap=cap)[i])
         return np.asarray(rows, dtype=np.float64)
 
+    def loading_all_options(self, targets, alive, fired, cap=None):
+        """``u[i, k]`` -- the nominal loading agent i WOULD meet on element k, for
+        every agent and every element at once, (n, m).
+
+        Peers keep the targets they actually chose; only agent i's own choice is
+        varied, and its own damage is excluded from every entry (j != i), so
+        switching target never makes an agent load itself.  Equal to
+        ``loading`` with agent i's target set to k, entry by entry.
+        """
+        t = np.asarray(targets, dtype=np.int64).reshape(self.n)
+        w = (np.asarray(alive, dtype=np.float64)
+             * np.asarray(fired, dtype=np.float64) * self.dmg)
+        capv = self._capvec(cap)
+        tot = np.zeros(self.m + 1)
+        np.add.at(tot, np.where(t >= 0, t, self.m), w)
+        own = (t[:, None] == np.arange(self.m)[None, :]) * w[:, None]    # (n, m)
+        peer = tot[None, :self.m] - own                                 # j != i
+        return np.minimum(peer / np.maximum(capv, 1e-12)[None, :], self.U_CLIP)
+
+    def psi_all_options(self, targets, alive, fired, cap=None):
+        """``psi_options`` for EVERY agent in one pass, (n, m, r+1).
+
+        The steering channel needs this on every env step.  The per-agent loop
+        above calls ``channels`` n*m times and cost ~10 ms of every SMAC step;
+        this is one array expression.  The layer checks the two agree at startup
+        and aborts if they do not (P-3.2).
+        """
+        val = self._share(self.loading_all_options(targets, alive, fired, cap))
+        raw = np.zeros((self.n, self.m, self.r))
+        for kk, c in enumerate(self.keep):
+            sel = self.cls_of == c
+            raw[:, sel, kk] = val[:, sel]
+        x = (raw - self.x_ref[None, None, :]) / self.x_scale[None, None, :]
+        return np.concatenate([np.ones((self.n, self.m, 1)), x], axis=2)
+
     # ------------------------------------------------------------------ loading
-    def loading(self, targets, alive, fired, g):
+    def loading(self, targets, alive, fired, g, cap=None):
         """``u_i`` -- the loading ratio on the element agent i is using.
 
         NS-1.1 says the aggregation is a MAXIMUM over the agent's own elements,
@@ -273,6 +366,7 @@ class Coupling(object):
              * np.asarray(fired, dtype=np.float64) * self.dmg)
         gg = np.broadcast_to(np.asarray(g, dtype=np.float64).reshape(-1), (self.m,)) \
             if np.size(g) > 1 else np.full(self.m, float(g))
+        capv = self._capvec(cap)
         tot = np.zeros(self.m + 1)
         np.add.at(tot, np.where(t >= 0, t, self.m), w)
         u = np.zeros(self.n)
@@ -281,7 +375,7 @@ class Coupling(object):
             if e < 0:
                 continue
             peer = tot[e] - w[i]                                    # j != i
-            u[i] = np.max([peer / max(1e-12, self.cap[e] * gg[e])])
+            u[i] = np.max([min(peer / max(1e-12, capv[e] * gg[e]), self.U_CLIP)])
         return u
 
     def excess(self, u_nom, g):

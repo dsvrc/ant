@@ -11,12 +11,12 @@ state_type: FP            # choose from FP (Feature Pruned) and EP (Environment 
 # experienced would be worthless as evidence.
 #
 #   medium    the enemy line's absorbable damage.  Element = an enemy unit,
-#             capacity = its PUBLISHED effective hit points (Zealot 150,
-#             Stalker 160).  Overkill is the canonical SMAC coordination
-#             failure -- "stop overkilling that zealot".
+#             capacity = its CURRENT effective hit points (life + shield, read
+#             off the game each step).  Overkill is the canonical SMAC
+#             coordination failure -- "stop overkilling that zealot".
 #   loading   u_i = (peer damage on my target) / capacity,  sum over j != i
 #   driver    the enemy line's guard cycle.  Shrinks absorption, never adds to
-#             the loss.  Reaches EXACTLY zero for half of every episode.
+#             the loss.  Reaches EXACTLY zero for half of every cycle.
 #   harm      excess_i = f(u/g)/f(u) - 1,  f(u) = 1 + alpha*u.  Handed back to
 #             the engine as restored hit points; the REWARD FUNCTION IS
 #             UNTOUCHED byte for byte.
@@ -31,18 +31,34 @@ ns_severity: 1.0          # THE ONE KNOB.  sigma=1 is anchored to SC2's own
                           # a Stalker's 10-damage hit = exactly 10%.
                           # sigma > 1 is a BEYOND-PHYSICAL STRESS TEST and must
                           # be labelled as such in every table and figure.
-ns_period: 150            # guard cycle, in env steps (one 3s5z episode limit)
+ns_period: 15000          # guard cycle, in env steps PER ENV PROCESS = 100 episode
+                          # limits.  URB's reference cycle is 100 days and one
+                          # battle is one day (GRF uses the same rule: 12000).
+                          # The estimator's memory (1/(1-mu) rows, ~2-3k steps at
+                          # SMAC's firing rate) must be a small fraction of this or
+                          # beta_hat averages the cycle and steers in the placebo.
+                          # The first run used 150 -- memory ~14x the period.
 ns_guard_frac: 0.5        # the rest of the cycle is the PLACEBO: A(t) is exactly
                           # 0 there, so g == 1.0000 for every sigma and the whole
                           # sweep is byte-identical (NS-2.5)
 ns_loss: 0.10             # the published anchor.  Do not round it to taste.
-ns_alpha: 2.28            # the LINEAR performance coefficient.  The medium runs
-                          # at u ~ 0.21 (URB: 0.219), two orders below where a
-                          # quartic exponent means anything, so the form is
-                          # linear by regime and not by convention (III.1).
+ns_alpha: 2.28            # the LINEAR performance coefficient, BORROWED from URB
+                          # and not yet calibrated for SMAC (III.1): calibrate it
+                          # once from `overkill_frac` in the debug file, by a
+                          # stated procedure, and freeze it.
 ns_mean_preserving: 0     # NS-5.1: normalise g by its cycle mean so only the
                           # SHAPE varies and total capacity is unchanged
 ns_seed: 0                # per-enemy guard sensitivity draw (declared, mean 1)
+ns_cap_mode: remaining    # capacity = the target's CURRENT effective hit points.
+                          # Overkill is measured against what is LEFT, not a full
+                          # bar.  "max" is the first run's definition and read
+                          # u = 0.027, i.e. the dial took 0.25% of damage.
+ns_steer_floor: 0.01      # steer only when the attackable options' predicted
+                          # relative excess spreads by >= 1% (std).  The z-score
+                          # rescales ANY spread to O(1); without a floor a residual
+                          # beta_hat in the placebo pushes agents off focus fire
+                          # when overkill costs nothing extra.  Declared, never
+                          # tuned -- sweep {0, 0.005, 0.01, 0.02} in the ablation.
 
 # --- the estimator.  Identical in every arm; only the trust term differs. ---
 ns_mu: 0.999              # RLS forgetting.  DECLARED -- sweep it, never tune it

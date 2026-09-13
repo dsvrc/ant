@@ -97,8 +97,12 @@ def decompose(coupling, driver, sigma, controllable, targets, alive, fired,
 
 def sweep(map_name="3s5z", n_agents=8, n_enemies=8, step_mul=8, alpha=2.28,
           sigmas=(0.5, 1.0, 2.0, 3.0), shares=(0.25, 0.5, 0.75, 1.0),
-          samples=400, seed=0, period=150):
-    """The I.5 table, plus NS-4.2's gap-versus-controllable-share curve."""
+          samples=400, seed=0, period=15000):
+    """The I.5 table, plus NS-4.2's gap-versus-controllable-share curve.
+
+    ``period`` only sets where the clock is sampled (uniformly over one cycle), so
+    the table is the same for any period; it defaults to the layer's 100 episode
+    limits so nothing reads as if the old 150-step cycle were still in use."""
     c = Coupling(map_name, n_agents, n_enemies, step_mul, alpha)
     d = GuardDriver(period=period)
     rng = np.random.RandomState(seed)
