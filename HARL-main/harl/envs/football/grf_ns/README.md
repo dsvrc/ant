@@ -37,9 +37,12 @@ cells is the one thing that is not publishable:
 | sensor | `y_i = k_i + c_i`: executed heading − sent heading, along the public direction. Proprioception at the actuator, exactly `simple_ns`'s residual | P-2.1 |
 | inverse | `c_i = g·d̂_i`, pre-rotate; with `d̂ = d` the net is exactly 0.0 and the executed action **is** the commanded action | II.6 row 1 |
 
-Identities that hold **exactly** and are asserted, not argued (`selftest.py`, 44
-checks, numpy only, ~45 s; `smoke.py` re-checks the load-bearing ones through
-the real engine):
+Identities that hold **exactly** and are asserted, not argued (`selftest.py`, 47
+checks, numpy only, ~50 s; `smoke.py` re-checks the load-bearing ones through
+the real engine at the ACTION level -- GRF does not reproduce a trajectory
+across two engine instances even under `env.seed()`, so "executed == commanded
+on every step" and a shadow blind channel fed the same positions are the
+in-engine statements, and they are exact):
 
 ```
 sigma = 0            ->  executed == commanded          the stock task, byte for byte
@@ -55,6 +58,21 @@ arm enacts **2.4× fewer** swerves than blind; the intercept arm enacts *more*
 than blind on (C) (a fleet-mean correction is wrong per agent) and removes
 **93 %** of them on the (B) control, where the full arm's `fit_gain` is −0.07.
 That pair is the measurement the classification rests on.
+
+## Who the agents are: controller slots, not players
+
+GRF exposes `n` controller **slots**; which player a slot drives is the
+engine's decision (`active` in the raw observation) and it changes: at
+kick-off the engine hands a slot the goalkeeper and auto-switches it onto the
+designated (ball) player on the first tick, and it switches again whenever the
+ball reaches an uncontrolled teammate. The layer keys everything on the slot,
+re-reads each slot's position every step, drops a slot's lane state when it
+changes player (`reset_slot`, counted as `switches` in the panel), and takes
+the references from the scenario's **declared** attacker geometry
+(`ceiling.SPAWN`) rather than from the kick-off frame -- then checks that
+geometry against the engine once after the first tick and warns on drift. The
+smoke suite prints the assignment sequence; if the steady state ever includes
+the keeper, the design (not the code) has to be revisited.
 
 ## Why the heading, and not the pace
 

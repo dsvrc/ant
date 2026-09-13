@@ -54,7 +54,7 @@ ARMS = {
 _COLS = [
     "env_step", "rollout", "wall_s",
     # is the dial live?  (every arm)
-    "sigma", "A", "amp", "placebo", "dial_live", "harmed_steps", "rot_sent", "stale",
+    "sigma", "A", "amp", "placebo", "dial_live", "harmed_steps", "rot_sent", "stale", "switches",
     # is the NS biting?
     "d", "k_abs", "y", "controlled_frac", "x_front", "x_flank", "x_std", "spread",
     # is the METHOD working?  (kept apart from "is it winning")
@@ -69,7 +69,7 @@ _KEY = {
     "sigma": ("ns_sigma", None), "A": ("ns_A", None), "amp": ("ns_amp", None),
     "placebo": ("ns_placebo", None), "dial_live": ("ns_dial_live", None),
     "harmed_steps": ("ns_harmed", None), "rot_sent": ("ns_rot_sent", None),
-    "stale": ("ns_stale", None),
+    "stale": ("ns_stale", None), "switches": ("ns_switch", None),
     "d": ("ns_d", None), "k_abs": ("ns_k", abs), "y": ("ns_y", None),
     "controlled_frac": ("ns_controlled", None), "x_front": ("ns_x_front", None),
     "x_flank": ("ns_x_flank", None), "x_std": ("ns_x_std", None),

@@ -307,6 +307,17 @@ def t_channel():
         cs.append(float(np.abs(huge.c).max()))
     check("corr_clip_bounds_the_correction", max(cs) <= huge.p.corr_clip + 1e-12 and max(cs) > 0,
           "max|c|=%.3f with corr_clip=%.1f" % (max(cs), huge.p.corr_clip))
+    # a controller slot handed a different player drops that player's lane state
+    sw = build(sigma=2.0, clock0=PEAK)
+    run(sw, 100, seed=2)
+    before = (int(sw.intended[0]), float(sw.acc[0]), float(np.abs(sw.Q[0]).sum()))
+    sw.reset_slot(0, 4)
+    after_ok = (sw.intended[0] == 4 and sw.acc[0] == 0.0 and float(np.abs(sw.Q[0]).sum()) == 0.0
+                and sw.applied_rot[0] == 0 and sw.n_switch == 1)
+    (A, E, K, _, _), _ = run(sw, 50, seed=3)
+    check("slot_switch_drops_the_old_player's_lane_state", after_ok and np.all(np.isfinite(E)),
+          "before=%s; after reset_slot: intended=%d acc=%.1f |Q|=%.1f; 50 more steps ran"
+          % (before, sw.intended[0], sw.acc[0], float(np.abs(sw.Q[0]).sum())))
 
 
 # =================================================================== estimator

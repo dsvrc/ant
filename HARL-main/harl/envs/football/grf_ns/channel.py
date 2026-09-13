@@ -166,6 +166,7 @@ class SwerveChannel(object):
         self.n_diverged = 0
         self.n_corr_clipped = 0
         self.n_clip_hits = 0
+        self.n_switch = 0
         self.reset_episode()
 
     # ------------------------------------------------------------------ lifecycle
@@ -201,6 +202,21 @@ class SwerveChannel(object):
         self.A = 0.0
         self.amp = 0.0
         self.spread = float("nan")
+
+    def reset_slot(self, i, heading=-1):
+        """The engine moved controller slot ``i`` onto a different player (GRF
+        auto-switches a controller onto the designated player).  The slot now
+        drives a different body: its lane state, its accumulator and its enacted
+        rotation belong to the old player and are dropped; the heading belief is
+        re-seeded from what the engine reports for the slot.  The slot's
+        ESTIMATOR persists -- beta* is the surface, not the player."""
+        i = int(i)
+        self.intended[i] = int(heading)
+        self.applied_rot[i] = 0
+        self.acc[i] = 0.0
+        self.Q[i] = 0.0
+        self.S[i] = 0.0
+        self.n_switch += 1
 
     # ------------------------------------------------------------------ the step
     def step(self, actions, pos, ball_owner=-1, clock=None):
@@ -443,6 +459,7 @@ class SwerveChannel(object):
             "ns_bounded": float(sum(r.n_bounded for r in self.rls)),
             "ns_corr_clipped": float(self.n_corr_clipped),
             "ns_spread": float(self.spread),
+            "ns_switch": float(self.n_switch),
             "ns_steps": float(self.n_steps),
         }
 
