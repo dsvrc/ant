@@ -28,14 +28,34 @@ class FootballEnv:
         self.n_agents = env_num_agents[self.args["env_name"]]
         self.share_observation_space = self.repeat(self.get_state_space())
         self.observation_space = self.get_obs_shape()
-        self.action_space = [Discrete(i) for i in self.env.action_space.nvec]
+        self.action_space = [Discrete(i) for i in self._nvec()]
         self.avail_actions = self.get_avail_actions()
+
+    # -- a SINGLE controlled player --------------------------------------------
+    # gfootball wraps a one-player env in SingleAgentObservationWrapper /
+    # SingleAgentRewardWrapper, which squeeze the agent axis off obs and reward
+    # and expose a plain Discrete action space instead of MultiDiscrete.  The
+    # three helpers below put the axis back so the N = 1 academy scenarios (used
+    # by grf_ns/smoke.py for the lone-agent identity) run through the same code
+    # path; for N >= 2 they are exact no-ops.
+    def _nvec(self):
+        sp = self.env.action_space
+        return sp.nvec if hasattr(sp, "nvec") else [sp.n]
+
+    def _unsqueeze_obs(self, obs):
+        if self.n_agents == 1 and np.ndim(obs) == (3 if self.img else 1):
+            return np.asarray(obs)[None]
+        return obs
+
+    def _unsqueeze_rew(self, rew):
+        return np.atleast_1d(rew) if self.n_agents == 1 else rew
 
     def step(self, actions):
         """
         return local_obs, global_state, rewards, dones, infos, available_actions
         """
         obs, rew, done, info = self.env.step(actions.flatten())
+        obs, rew = self._unsqueeze_obs(obs), self._unsqueeze_rew(rew)
         rewards = [[rew[0]]] * self.n_agents
         if self.img:
             obs = obs.transpose(0, 3, 1, 2)
@@ -50,7 +70,7 @@ class FootballEnv:
 
     def reset(self):
         """Returns initial observations and states"""
-        obs = self.env.reset()
+        obs = self._unsqueeze_obs(self.env.reset())
         if self.img:
             obs = obs.transpose(0, 3, 1, 2)
         return self.split(obs), self.repeat(self.get_state()), self.avail_actions
@@ -137,6 +157,13 @@ class FootballEnv:
 
     def get_obs_shape(self):
         obs_sp = self.env.observation_space
+        if self.n_agents == 1 and len(obs_sp.shape) == (3 if self.img else 1):
+            # the single-agent wrapper squeezed the agent axis off the space too
+            if self.img:
+                w, h, c = obs_sp.shape
+                return [Box(low=obs_sp.low.transpose(2, 0, 1), high=obs_sp.high.transpose(2, 0, 1),
+                            shape=(c, w, h), dtype=obs_sp.dtype)]
+            return [Box(low=obs_sp.low, high=obs_sp.high, shape=obs_sp.shape, dtype=obs_sp.dtype)]
         if self.img:
             w, h, c = self.env.observation_space.shape[1:]
             return [
