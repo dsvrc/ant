@@ -35,6 +35,7 @@ from harl.runners.on_policy_pact_ns_runner import (
     PactNsRunner,
 )
 from harl.runners.on_policy_grf_ns_runner import GRF_ARMS
+from harl.runners.on_policy_ant_ns_runner import ANT_ARMS
 
 
 # PACT-1 on SMAC-NS (Coupling Under Drift).  Five arms through the IDENTICAL
@@ -58,6 +59,7 @@ def _pact_runner(args, algo_args, env_args):
 
       smac     -> SMAC-NS (harl/envs/smac/smac_ns/), the steering channel.
       football -> GRF-NS (harl/envs/football/grf_ns/), the exact-inverse channel.
+      mamujoco_ns -> ANT-NS (harl/envs/mamujoco/ant_ns/), the torque inverse.
       smacv2   -> the legacy coupled-weapon-overheat runner.
       mamujoco -> the continuous PACT runner.
     """
@@ -65,6 +67,8 @@ def _pact_runner(args, algo_args, env_args):
         return PactNsRunner(args, algo_args, env_args)
     if args["env"] == "football":
         return GRF_ARMS["pact"](args, algo_args, env_args)
+    if args["env"] == "mamujoco_ns":
+        return ANT_ARMS["pact"](args, algo_args, env_args)
     if args["env"] == "smacv2":
         return OnPolicyPactSmacRunner(args, algo_args, env_args)
     return OnPolicyPactRunner(args, algo_args, env_args)
@@ -79,6 +83,8 @@ def _by_env(name):
     def _make(args, algo_args, env_args):
         if args["env"] == "football":
             return GRF_ARMS[name](args, algo_args, env_args)
+        if args["env"] == "mamujoco_ns":
+            return ANT_ARMS[name](args, algo_args, env_args)
         return smac_cls(args, algo_args, env_args)
 
     return _make

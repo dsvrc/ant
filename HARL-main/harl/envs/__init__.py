@@ -14,6 +14,7 @@ FLAGS(["train_sc.py"])
 LOGGER_REGISTRY = {
     "smac": SMACLogger,
     "mamujoco": MAMuJoCoLogger,
+    "mamujoco_ns": MAMuJoCoLogger,
     "pettingzoo_mpe": PettingZooMPELogger,
     "gym": GYMLogger,
     "football": FootballLogger,

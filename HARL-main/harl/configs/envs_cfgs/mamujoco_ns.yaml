@@ -1,0 +1,143 @@
+# MAMuJoCo Ant under drift -- the ANT-NS task.   harl/envs/mamujoco/ant_ns/
+#
+# A SEPARATE task config from `mamujoco.yaml` on purpose.  `mamujoco.yaml` is
+# shared by eight other method families in this repo (echor, ecl, recon, omax,
+# diag, pact, pact1, doraemon), and flipping a dial in it would silently change
+# every one of them.  Naming the task instead keeps NS-3.1 exactly: the dial is
+# in the TASK configuration, so `--env mamujoco_ns` gives EVERY algorithm the
+# identical physics, and `--ns_on 0` gives stock Ant byte for byte for B0.
+#
+#   python examples/train.py --algo happo --env mamujoco_ns --exp_name blind
+#   python examples/train.py --algo happo --env mamujoco_ns --exp_name b0 --ns_on 0
+#
+# =============================================================================
+#  THE STORY.  Every clause below is a requirement, not colour.
+# =============================================================================
+#
+#    Four legs are bolted to one torso.  When another leg drives hard the trunk
+#    reacts, and that reaction arrives at my hips as a torque I never commanded:
+#    I am holding against my neighbours.  How much of a neighbour's push reaches
+#    me depends on the state of the drivetrain -- a cold machine is stiff and
+#    crisply preloaded; over a run the gearbox and bearing grease warm,
+#    viscosity falls, preload drops and backlash opens, and the same push
+#    arrives through a softer, sloppier path.  Nobody on the robot decides how
+#    warm it is.  A leg alone on the torso -- the others slack -- feels nothing
+#    from the others at any temperature.
+#
+#    interaction-mediated  the reaction is caused by the OTHER agents' torques;
+#                          the sum is over j != i, so a lone agent reads exactly
+#                          zero at every severity            (gate 3, asserted)
+#    exogenous             drivetrain temperature over a run: a function of the
+#                          clock alone.  Ask a roboticist what makes the machine
+#                          behave differently between sessions and "it hadn't
+#                          warmed up" comes back unprompted
+#    never a reward term   the disturbance is applied BELOW the reward, at
+#                          `do_simulation`, so Ant's reward -- forward velocity,
+#                          control cost, contact cost, survival -- is byte-for-
+#                          byte the host's own and the control cost is charged
+#                          on the torque the POLICY commanded
+#    invertible            the disturbance is a torque and the action is a
+#                          torque, so a correct estimate SUBTRACTS it: the
+#                          executed torque, the reward and the trajectory become
+#                          the sigma = 0 ones, exactly.  It dies at the actuator
+#                          limit, which is where sigma* comes from
+#    the classes are real  hip<-hip, ankle<-ankle and the cross path are public
+#                          (which joint is which is the hardware); what a
+#                          neighbour's torque on each path costs you TODAY is not
+#
+#  WHY THIS INSTANCE IS THE CHEAPEST TO DEFEND: the coupling is NOT injected.
+#  Four legs on one torso already load each other in stock Ant, at every
+#  severity including zero.  What the dial injects is only the DRIFT in how
+#  strongly the structure transmits.
+#
+#  ANCHOR, STATED HONESTLY (NS-2.4).  A simulated quadruped has no published
+#  constant for "how much more of your neighbour's push reaches you when the
+#  gearbox is warm", so sigma = 1 is a stated calibration PROCEDURE, not an
+#  anchor: at sigma = 1, at the driver's peak, with every peer commanding its
+#  full torque range, the disturbance reaching an agent is 0.14 of its own
+#  torque range (measured by ceiling.py: 0.1397).  0.14 is carried over from the
+#  HCM heavy-rain figure only so the instances share a severity scale.  Every
+#  sigma > 1 is a BEYOND-PHYSICAL stress test and is labelled so everywhere.
+#
+#  COMMITTED OPERATING POINT.  ns_severity below is a PLACEHOLDER until
+#  calibrate.py has run against a trained B0 checkpoint.  Commit the chosen row
+#  and the ladder it came from here:
+#
+#    sigma   blind   pact   oracle   intercept   corr_clipped   (return, 3 seeds)
+#    0       ....    ....   ....     ....        ....           <- from calibrate.py
+#    1       ....    ....   ....     ....        ....
+#    2       ....    ....   ....     ....        ....
+#    3       ....    ....   ....     ....        ....
+#
+#  Choose the smallest sigma at which the blind arm has lost a clear margin and
+#  the oracle still recovers B0 -- the row then measures the METHOD rather than
+#  the environment.
+
+# -- the host (stock MAMuJoCo Ant; identical to mamujoco.yaml's own keys) ------
+scenario: Ant-v2
+agent_conf: 4x2          # the REFERENCE partition.  2x4 / 2x4d / 8x1 also run:
+                         #   that is the N-scaling experiment (NS-4.2), and the
+                         #   dial, the basis and r = 3 are identical in all of
+                         #   them -- only the partition moves.
+agent_obsk: 0            # fully observable, as HARL ships it
+episode_limit: 1000
+
+# =============================================================================
+#  the dial -- TASK PHYSICS (NS-3.1), so every algorithm runs inside it
+# =============================================================================
+ns_on: 1                 # 1 = the layer is in; 0 = stock Ant (B0)
+ns_severity: 1.0         # sigma.  EXACTLY inert at 0.0.  PLACEHOLDER -- see above.
+
+# -- the driver: A(t), a sin^2 bump that is EXACTLY zero for the cold half -----
+ns_period: 20000         # ~17 min at dt = 0.05 s, the time scale a drivetrain
+                         #   warms over.  MEASURED: A moves 3.1e-4 per step,
+                         #   0.031 over the estimator's 100-step memory and up to
+                         #   0.31 over a full 1000-step episode -- slow against
+                         #   the control loop, NOT frozen within an episode.
+ns_warm_fraction: 0.5    # the rest of the cycle is the placebo (NS-2.5)
+ns_loss_at_sigma1: 0.14  # the stated calibration target, see above
+ns_mean_preserving: 0    # NS-5.1 variant: same transmitted load per cycle at every sigma
+ns_phase0: 0             # clock origin; rollout threads are de-phased from it
+
+# -- the medium and the declared classes --------------------------------------
+ns_rho: 0.8              # trunk memory: compliance and backlash integrate
+ns_length_scale: 0.25    # ant.xml's OWN torso radius (published geometry)
+ns_recv_hip: 0.7         # receiver susceptibility by joint type: an ankle carries
+ns_recv_ankle: 1.3       #   only the foot, so the same reaction throws it further.
+                         #   The startup banner prints the model's own inverse-
+                         #   inertia ratio next to these.
+ns_send_hh: 1.5          # beta* per load path, normalised to mean 1.  UNKNOWN to
+ns_send_aa: 0.9          #   the agent; what the estimator must recover.  Hips bolt
+ns_send_cross: 0.6       #   straight to the trunk and load each other hardest.
+ns_y_clip: 10.0          # P-2.1 declared sensor bound; clip_frac is reported
+ns_corr_clip: 0.5        # relief valve: the feed-forward never exceeds half the
+                         #   torque range (closes trap 11 -- a diverged estimate
+                         #   scoring well by accident through a saturating kick)
+ns_load_norm: 0.337038   # COMMITTED from ceiling.py at the 4x2 REFERENCE partition.
+                         #   Deliberately NOT recomputed per partition: at 8x1 the
+                         #   same sigma delivers more because there ARE more peers,
+                         #   and that is the N-scaling prediction rather than a
+                         #   change of dial.  The layer prints both and warns.
+
+# -- the (B) control ----------------------------------------------------------
+ns_direct: 0             # 1 = the same disturbance reaches every agent directly,
+                         #     opposing its own torque, with no sum over j != i.
+                         #     A lone agent then feels it.  The pair (0 vs 1) is
+                         #     the experiment the classification rests on.
+
+# -- the compensator.  SET BY THE PACT-FAMILY RUNNERS, never here. -------------
+ns_pact: 0               # runner sets 1
+ns_trust: "off"          # QUOTED: bare `off` is YAML for False.  runner sets
+                         #   "off" | "fixed".  Learned trust is not implementable
+                         #   on an action-space inverse (P-6.2) -- see channel.py
+ns_g_fixed: 0.9          # P-5.1 inverted prior, gated by prediction confidence
+ns_oracle: 0             # runner sets 1 for the ceiling arm
+ns_intercept_only: 0     # runner sets 1 for the (B)-vs-(C) probe
+ns_mu: 0.99              # RLS forgetting, a ~100-step memory.  Sweep on PREDICTION
+                         #   ERROR, never on return (trap 10).
+ns_p0: 10.0
+ns_warmup: 50            # rows per agent before trust engages
+ns_p_trace_max: 100.0    # covariance windup bound (trap 7); 0 disables
+
+# -- ablation: hand every arm's policy its own residual (obs +1) ---------------
+ns_observe_residual: 0

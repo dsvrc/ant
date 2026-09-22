@@ -176,6 +176,16 @@ def make_train_env(env_name, seed, n_threads, env_args):
                     )
 
                     env = MujocoMulti(env_args=env_args)
+            elif env_name == "mamujoco_ns":
+                # ANT-NS: the Coupling-Under-Drift layer on MAMuJoCo Ant, read
+                # from the TASK config so EVERY algorithm runs inside the same
+                # physics (NS-3.1).  A SEPARATE task from `mamujoco` on purpose:
+                # that config is shared by eight other method families here, and
+                # flipping a dial in it would silently change all of them.
+                # ``ns_on: 0`` gives stock MujocoMulti for a B0 reference run.
+                from harl.envs.mamujoco.ant_ns import make_ant_ns_env
+
+                env = make_ant_ns_env(env_args, rank, n_threads)
             elif env_name == "pettingzoo_mpe":
                 from harl.envs.pettingzoo_mpe.pettingzoo_mpe_env import (
                     PettingZooMPEEnv,
@@ -311,6 +321,16 @@ def make_eval_env(env_name, seed, n_threads, env_args):
 
                     env = MujocoMulti(env_args=ea)
                     set_pcr_clock_offset(env, pcr_offset)
+            elif env_name == "mamujoco_ns":
+                # ANT-NS: the Coupling-Under-Drift layer on MAMuJoCo Ant, read
+                # from the TASK config so EVERY algorithm runs inside the same
+                # physics (NS-3.1).  A SEPARATE task from `mamujoco` on purpose:
+                # that config is shared by eight other method families here, and
+                # flipping a dial in it would silently change all of them.
+                # ``ns_on: 0`` gives stock MujocoMulti for a B0 reference run.
+                from harl.envs.mamujoco.ant_ns import make_ant_ns_env
+
+                env = make_ant_ns_env(env_args, rank, n_threads)
             elif env_name == "pettingzoo_mpe":
                 from harl.envs.pettingzoo_mpe.pettingzoo_mpe_env import (
                     PettingZooMPEEnv,
@@ -405,6 +425,11 @@ def make_render_env(env_name, seed, env_args):
 
             env = MujocoMulti(env_args=env_args)
         env.seed(seed * 60000)
+    elif env_name == "mamujoco_ns":
+        from harl.envs.mamujoco.ant_ns import make_ant_ns_env
+
+        env = make_ant_ns_env(env_args, 0, 1)
+        env.seed(seed * 60000)
     elif env_name == "pettingzoo_mpe":
         from harl.envs.pettingzoo_mpe.pettingzoo_mpe_env import PettingZooMPEEnv
 
@@ -463,6 +488,8 @@ def get_num_agents(env, env_args, envs):
     elif env == "smacv2":
         return envs.n_agents
     elif env == "mamujoco":
+        return envs.n_agents
+    elif env == "mamujoco_ns":
         return envs.n_agents
     elif env == "pettingzoo_mpe":
         return envs.n_agents

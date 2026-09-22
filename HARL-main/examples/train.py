@@ -62,6 +62,7 @@ def main():
         choices=[
             "smac",
             "mamujoco",
+            "mamujoco_ns",
             "pettingzoo_mpe",
             "gym",
             "football",
@@ -69,7 +70,7 @@ def main():
             "smacv2",
             "lag",
         ],
-        help="Environment name. Choose from: smac, mamujoco, pettingzoo_mpe, gym, football, dexhands, smacv2, lag.",
+        help="Environment name. Choose from: smac, mamujoco, mamujoco_ns, pettingzoo_mpe, gym, football, dexhands, smacv2, lag.",
     )
     parser.add_argument(
         "--exp_name", type=str, default="installtest", help="Experiment name."
