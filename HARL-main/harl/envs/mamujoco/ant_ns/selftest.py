@@ -145,9 +145,12 @@ def t_operator():
     check("front_paths_cost_more_than_cross_by_declaration",
           drv.send[0] > drv.send[1] > drv.send[2],
           "send = %s for %s (mean 1)" % (np.round(drv.send, 3).tolist(), list(CLASS_NAMES)))
-    check("recv_is_normalised_and_asymmetric",
-          abs(float(recv_vector(p.recv_hip, p.recv_ankle).mean()) - 1.0) < 1e-12
-          and p.recv_ankle != p.recv_hip)
+    rv = recv_vector(p.recv_spread)
+    check("recv_is_normalised_and_spread",
+          abs(float(rv.mean()) - 1.0) < 1e-12 and float(rv.max() / rv.min()) > 1.5,
+          "recv in [%.2f, %.2f], ratio %.1fx -- a DECLARED per-actuator "
+          "heterogeneity, and the only source of the operator's asymmetry"
+          % (rv.min(), rv.max(), rv.max() / rv.min()))
 
     #  P-3.3 / trap 4: the centred regressor must be O(1).  Getting the
     #  reference wrong gave psi = 11.8 on a previous instance, which wrecked the

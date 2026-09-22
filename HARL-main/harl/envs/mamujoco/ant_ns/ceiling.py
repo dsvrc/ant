@@ -42,7 +42,7 @@ import numpy as np
 from .coupling import Coupling, _LoneCoupling
 from .driver import DialParams, ThermalDriver
 from .structure import (CLASS_NAMES, JOINT_NAMES, N_JOINTS, agent_of, describe, kernel,
-                        partition_of, recv_vector)
+                        kernel_source, partition_of, recv_vector)
 
 
 def peer_load(p, driver, agent_conf, load_norm, sigma=1.0, samples=4096, seed=1,
@@ -83,7 +83,7 @@ def coordination_share(p, agent_conf):
     physics is simply re-labelled from "solvable alone" to "requires
     coordination".  That is the mechanism behind NS-4.2's prediction.
     """
-    K = recv_vector(p.recv_hip, p.recv_ankle)[:, None] * kernel(p.length_scale)
+    K = recv_vector(p.recv_spread)[:, None] * kernel(p.length_scale)
     K = K * (~np.eye(N_JOINTS, dtype=bool))
     owner = agent_of(partition_of(agent_conf))
     peer = float((K * (owner[:, None] != owner[None, :])).sum())
@@ -209,8 +209,8 @@ def main():
                joint_names=list(JOINT_NAMES), classes=list(CLASS_NAMES),
                dial=dict(period=p.period, warm_fraction=p.warm_fraction,
                          loss_at_sigma1=p.loss_at_sigma1, rho=p.rho,
-                         length_scale=p.length_scale, recv_hip=p.recv_hip,
-                         recv_ankle=p.recv_ankle, send=driver.send.tolist(),
+                         length_scale=p.length_scale, recv_spread=p.recv_spread,
+                         kernel_source=kernel_source()[0], send=driver.send.tolist(),
                          corr_clip=p.corr_clip))
     if a.out:
         with open(a.out, "w", encoding="utf-8") as f:

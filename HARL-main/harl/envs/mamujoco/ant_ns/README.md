@@ -43,7 +43,7 @@ every sum runs over `j ≠ i`.
 | object | Ant | check |
 |---|---|---|
 | medium | the trunk every leg is bolted to; element = a joint | — |
-| operator `W[p,q]` | `recv_p · κ(d_pq) · 1[agent(p) ≠ agent(q)]`, `κ = 1/(1+(d/L)²)` on the published anchor geometry, `L` = `ant.xml`'s own torso radius 0.25. **zero-diag, spread 0.379, ratio 3.5×, asym 0.150, 48 links** | NS-1.2 |
+| operator `W[p,q]` | `recv_p · κ(p,q) · 1[agent(p) ≠ agent(q)]`. `κ` is the machine's own nominal-pose `|M⁻¹|` once `dump_operator.py` has been run, else a distance falloff on the published anchors. **zero-diag, spread 0.621, ratio 12.5×, asym 0.194, 48 links** | NS-1.2 |
 | `r` classes | the load path by joint type: **hip←hip / ankle←ankle / cross**. `r = 3`, independent of N *and* of the number of joints | P-1.1 |
 | `β*` | `σ·L·A(t)·send`, `send = [1.5, 0.9, 0.6]` (mean 1) — what a neighbour's torque on each path costs **today**. Unknown to the agent | P-1.2 |
 | driver `A(t)` | drivetrain thermal state: a `sin²` bump over the warm half of a 20000-step cycle, **exactly 0** for the cold half | NS-1.3, NS-2.5 |
@@ -70,10 +70,10 @@ same number in exact arithmetic and differs by an ulp in floating point, which
 would have cost the ceiling identity.
 
 **Measured offline** (synthetic gait, σ=2, μ=0.99, 4x2): `fit_gain 0.999`,
-`beta_cos 1.000`, `beta_relerr 0.005`, `cond_psi 6.0`. Mean `|executed −
-commanded|` over the warm peak: **blind 0.0628 → pact 0.0048** (13×), intercept
-0.0253, against a disturbance of 0.0645. The (B)/(C) pair, as a ratio of
-residuals `intercept / full`: **(C) 5.26× — the peer channels are load-bearing;
+`beta_cos 1.000`, `beta_relerr 0.006`, `cond_psi 3.6`. Mean `|executed −
+commanded|` over the warm peak: **blind 0.0568 → pact 0.0043** (13×), intercept
+0.0246, against a disturbance of 0.0582. The (B)/(C) pair, as a ratio of
+residuals `intercept / full`: **(C) 5.70× — the peer channels are load-bearing;
 (B) 0.93× — they carry nothing.** That pair is the measurement the
 classification rests on.
 
@@ -87,10 +87,10 @@ alone" and into "requires coordination" **without making the task lossier**:
 | `agent_conf` | N | \|d\| per actuator | machine's coupling crossing an agent boundary |
 |---|---|---|---|
 | `1x8` | 1 | 0.0000 | 0.0 % — a lone agent, structurally |
-| `2x4` | 2 | 0.0444 | 38.6 % |
-| `2x4d` | 2 | 0.0526 | 49.0 % |
-| **`4x2`** | **4** | **0.0567** | **63.1 %** |
-| `8x1` | 8 | 0.0745 | 100.0 % |
+| `2x4` | 2 | 0.0447 | 40.1 % |
+| `2x4d` | 2 | 0.0537 | 50.9 % |
+| **`4x2`** | **4** | **0.0566** | **65.6 %** |
+| `8x1` | 8 | 0.0609 | 100.0 % |
 
 Every row from N=2 down is a **real training config**, so the prediction that the
 coordination gap rises with N is an experiment here, not only an offline curve.
@@ -162,6 +162,7 @@ that, rather than "constant within an episode".
 | `layer.py` | the severity **mixin** over `MujocoMulti`; hooks `do_simulation` |
 | `keys.py` | every yaml key the layer reads, mujoco-free |
 | `ceiling.py` | Part C: the partition, the N-scaling, the references (→ `ceiling.json`) |
+| `dump_operator.py` | reads the machine's own `|M⁻¹|` out of the model (→ `operator.json`) |
 | `selftest.py` | offline conformance; no mujoco, no torch |
 | `smoke.py` | in-simulator identities; needs mujoco |
 | `calibrate.py` | the σ ladder against a trained B0 checkpoint, all five arms |
@@ -190,13 +191,24 @@ python -m harl.envs.mamujoco.ant_ns.selftest
 python -m harl.envs.mamujoco.ant_ns.ceiling --out harl/envs/mamujoco/ant_ns/ceiling.json
 ```
 
-**2. Smoke, in the engine (minutes).**
+**2. The machine's own operator (once, where MuJoCo lives).** Replaces the
+geometric surrogate; the references change, so `ceiling.py` and the committed
+`ns_load_norm` must be redone after it.
+
+```bash
+python -m harl.envs.mamujoco.ant_ns.dump_operator
+```
+```bash
+python -m harl.envs.mamujoco.ant_ns.ceiling --out harl/envs/mamujoco/ant_ns/ceiling.json && python -m harl.envs.mamujoco.ant_ns.selftest && python -m harl.envs.mamujoco.ant_ns.check_plumbing
+```
+
+**3. Smoke, in the engine (minutes).**
 
 ```bash
 python -m harl.envs.mamujoco.ant_ns.smoke
 ```
 
-**3. B0 — stock Ant, dial off.** The competent controller the ladder needs (Ant
+**4. B0 — stock Ant, dial off.** The competent controller the ladder needs (Ant
 ships no scripted gait, and a random policy has nothing to lose). Host flags are
 `tuned_configs/mamujoco/Ant-v2-4x2`, defined once:
 
@@ -207,7 +219,7 @@ export TUNED="--n_rollout_threads 20 --num_env_steps 10000000 --episode_length 2
 for S in 1 2 3; do python examples/train.py --algo happo --env mamujoco_ns --exp_name b0 --ns_on 0 --seed $S $TUNED; done
 ```
 
-**4. Calibrate σ against B0, then commit the operating point.**
+**5. Calibrate σ against B0, then commit the operating point.**
 
 ```bash
 python -m harl.envs.mamujoco.ant_ns.calibrate --run_dir results/mamujoco_ns/Ant-v2-4x2/happo/b0/seed-00001-<stamp> --sigmas 0,0.25,0.5,1,1.5,2,3 --episodes 20 --threads 10 --phase peak --out ladder_peak.json
@@ -217,7 +229,7 @@ Run it again with `--phase cycle --out ladder_cycle.json` (the cycle average is
 what training sees), then commit the chosen `ns_severity` and the table into
 `mamujoco_ns.yaml`.
 
-**5. The arms.** Five, through the identical layer (P-9.1). `blind` is
+**6. The arms.** Five, through the identical layer (P-9.1). `blind` is
 `--algo happo` inside the dial; `pactoff` is provably bit-identical to it and
 additionally writes the panel.
 
@@ -225,14 +237,14 @@ additionally writes the panel.
 for A in happo pactoff pact pact_oracle pact_intercept; do python examples/train.py --algo $A --env mamujoco_ns --exp_name $A --seed 1 $TUNED; done
 ```
 
-**6. The existing algorithms, inside the identical physics.** These are what
+**7. The existing algorithms, inside the identical physics.** These are what
 should fall.
 
 ```bash
 for A in mappo hatrpo haa2c; do python examples/train.py --algo $A --env mamujoco_ns --exp_name ${A}_ns --seed 1 $TUNED; done
 ```
 
-**7. The (B) control** — the pair the classification rests on.
+**8. The (B) control** — the pair the classification rests on.
 
 ```bash
 python examples/train.py --algo pact --env mamujoco_ns --exp_name pact_B --ns_direct 1 --seed 1 $TUNED
@@ -241,13 +253,13 @@ python examples/train.py --algo pact --env mamujoco_ns --exp_name pact_B --ns_di
 python examples/train.py --algo pact_intercept --env mamujoco_ns --exp_name intercept_B --ns_direct 1 --seed 1 $TUNED
 ```
 
-**8. The N-scaling, as training runs (NS-4.2).**
+**9. The N-scaling, as training runs (NS-4.2).**
 
 ```bash
 for C in 2x4 4x2 8x1; do for A in pactoff pact; do python examples/train.py --algo $A --env mamujoco_ns --exp_name ${A}_$C --agent_conf $C --seed 1 $TUNED; done; done
 ```
 
-**9. Ablations.**
+**10. Ablations.**
 
 ```bash
 python examples/train.py --algo pact --env mamujoco_ns --exp_name abl_mu995 --ns_mu 0.995 --seed 1 $TUNED
@@ -276,6 +288,89 @@ II.10: "is the method working" and "is it winning" are separate columns.
 | `tau_rms` | the commons: is compensating making everyone push harder? | **logged, never acted on** |
 | `ep_return`, `r_forward`, `r_ctrl`, `r_contact`, `r_survive` | is it winning — and did it *fall* or just slow down? | — |
 
+## Before anything else: the host must be stock
+
+The layer runs **gate 0** at construction and aborts if the installed gym
+`ant.py` carries a coupling of its own. This is not hypothetical — this repo has
+shipped a diagnostic Ant that announces itself with
+
+```
+[DIAG ENV] SEVERITY=0.45 FREEZE_A=None MASK=both ... RHO=0.8 P=40000 B=0.2
+```
+
+and applies its own peer coupling. Stacking ANT-NS on that would mean
+`ns_severity: 0` is **not** the stock task, so B0 and every ladder row would be
+measured against an already-disturbed baseline — entirely plausible numbers,
+wrong experiment. Restore the stock 59-line `gym/envs/mujoco/ant.py`, or set
+that env's own severity to 0, before running anything. `ns_allow_patched_host: 1`
+exists only to experiment and makes a run unreportable; `check_plumbing.py`
+fails if it is left on.
+
+## Gate 4 compares distances, not coordinates
+
+Ant's `reset_model` perturbs the free joint's quaternion, so the whole body sits
+at a small arbitrary yaw — measured at a fresh reset, every joint rotated by the
+same ~10°. The operator only ever uses **pairwise distances** (`κ` is a function
+of distance alone), so that is what the gate compares: radii agree to 2 %,
+distances to 3.6 %, kernel correlation **0.9997**, and the ordering the
+structure rests on holds exactly (own ankle 0.439 > adjacent leg 0.288 >
+diagonal leg 0.164). Comparing world-frame coordinates would fail on a robot
+that is entirely correct.
+
+## Two things the server measured, and what changed because of them
+
+**The host must be stock.** The layer runs **gate 0** at construction and aborts
+if the installed gym `ant.py` carries a coupling of its own. This is not
+hypothetical — the first server run reported
+
+```
+[DIAG ENV] SEVERITY=0.45 FREEZE_A=None MASK=both ... RHO=0.8 P=40000 B=0.2
+```
+
+a diagnostic Ant from this repo's earlier PACT work, applying its own peer
+coupling. Stacking ANT-NS on that would make `ns_severity: 0` something other
+than the stock task, so B0 and every ladder row would be measured against an
+already-disturbed baseline. Restore the stock `gym/envs/mujoco/ant.py` first.
+`ns_allow_patched_host: 1` exists only to experiment and makes a run
+unreportable; `check_plumbing.py` fails if it is left on.
+
+**`recv` is declared, and the model refuted the first version of it.** An
+earlier draft declared a hip/ankle susceptibility ratio of 1.86, arguing that an
+ankle carries only the foot. The model was asked and answered **1.01** — Ant's
+hips and ankles are equally easy to accelerate. The argument was wrong and was
+removed rather than defended. What stands in its place is a declared
+per-actuator heterogeneity (build tolerance and wear, `recv_spread = 0.35`,
+mean 1), stated as injected rather than measured, exactly as `simple_ns` states
+`recv_spread` and `smac_ns` its per-enemy sensitivity. It is the only source of
+the operator's asymmetry, because the transmission structure itself is
+symmetric.
+
+## Gate 4 compares distances, not coordinates
+
+Ant's `reset_model` perturbs the free joint's quaternion, so the whole body sits
+at a small arbitrary yaw — measured on two fresh resets, every joint rotated by
+the same amount, once −10° and once +9°. The operator only ever uses **pairwise
+distances**, so that is what the gate compares: radii agree to 2 %, distances to
+3.6 %, and the ordering the structure rests on holds (own ankle 0.439 >
+adjacent leg 0.288 > diagonal leg 0.164). Comparing world-frame coordinates
+fails on a robot that is entirely correct, and did.
+
+## The operator: surrogate now, the machine's own after one command
+
+`κ` ships as a distance falloff on the published anchor geometry. Measured
+against the machine's own cross-inertia on your Ant, that surrogate correlates
+only **+0.19** — same support, same ordering, different shape. So it is a
+declared transmission *model*, not the machine's own sensitivity.
+
+`dump_operator.py` replaces it with the real thing: the joint-space inverse
+inertia `|M⁻¹|` at the nominal pose, which is literally "how much does a unit
+torque at q accelerate p" — the mechanical counterpart of POWER's PTDF and
+URB's incidence-over-capacity. Run it once where MuJoCo is installed, and the
+injected disturbance then amplifies the machine's **own** coupling rather than
+laying a differently-shaped one on top. The banner always says which is in
+force, and the layer re-checks a committed operator against the live model at
+startup.
+
 ## Honest limits
 
 1. **σ = 1 is a stated calibration, not a published anchor.** A simulated
@@ -298,16 +393,28 @@ II.10: "is the method working" and "is it winning" are separate columns.
 4. **The Part-C endpoint carries no information** (100 % peer by construction —
    every actuator on the machine belongs to an agent). Quote the N-scaling
    curve.
-5. **`recv_hip` / `recv_ankle` are declared, not derived.** The startup banner
-   prints the model's own inverse-inertia diagonal ratio beside them and
-   `smoke.py` checks the correlation; if they disagree, change the declaration
-   and re-run `ceiling.py` rather than leaving it.
-6. **`ns_load_norm` is committed at the `4x2` reference partition** and is
+5. **`recv_spread` is declared and injected, not measured.** Ant's four legs
+   are identical, so nothing in the simulator supports a per-actuator spread;
+   it is a property of real hardware asserted here to give the operator its
+   asymmetry. Say so. (The version of this claim the model refuted is recorded
+   above rather than quietly deleted.)
+6. **Until `dump_operator.py` is run, `κ` is a declared transmission model**
+   that correlates +0.19 with the machine's own cross-inertia. The story
+   ("the trunk transmits") is unaffected — the support and the ordering are
+   right — but "the operator is the robot's own sensitivity" may only be
+   claimed after the dump.
+7. **`ns_load_norm` is committed at the `4x2` reference partition** and is
    deliberately *not* recomputed per partition: at `8x1` the same σ delivers
    more because there **are** more peers, which is the N-scaling prediction
    rather than a change of dial. The layer prints both and warns.
-7. **The driver's shape is injected.** Thermal drift is what a practitioner
+8. **The driver's shape is injected.** Thermal drift is what a practitioner
    names; the `sin²` cycle is ours.
-8. **`Ant-v2` only.** `manyagent_ant` and other scenarios must run with
+9. **The operator is a nominal-pose linearisation.** `κ` is evaluated once
+   from the declared geometry and held fixed; the real distances move as the
+   ant walks. That is the standard declared-sensitivity choice (URB's
+   incidence-over-capacity and POWER's PTDF are the same kind of object), and
+   it is what keeps the operator declared rather than fitted — but it is a
+   modelling choice and belongs in the ablation table.
+10. **`Ant-v2` only.** `manyagent_ant` and other scenarios must run with
    `ns_on: 0` until a structure is declared for them — the layer raises rather
    than silently doing nothing.

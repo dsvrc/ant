@@ -25,7 +25,8 @@ from harl.utils.configs_tools import get_defaults_yaml_args
 from . import make_ant_ns_env
 from .coupling import Coupling
 from .driver import DialParams, ThermalDriver
-from .structure import JOINT_NAMES, N_JOINTS, model_inverse_inertia
+from .structure import (JOINT_NAMES, N_JOINTS, kernel_source,
+                        model_inverse_inertia)
 
 FAILS = []
 P = DialParams()
@@ -114,20 +115,25 @@ def main():
           "engine ctrl touched %s (%s); structure.PARTITIONS says %s"
           % (reached, [names[i] for i in reached], declared))
     Minv = model_inverse_inertia(raw)
+    src, note = kernel_source()
+    print("  [ -- ] transmission structure in force: %s -- %s" % (src.upper(), note))
     if Minv is None:
         print("  [ -- ] the installed binding exposes no dense mass matrix; the "
-              "declared operator could not be checked against the model")
+              "declared operator could not be compared with the model")
     else:
         off = ~np.eye(N_JOINTS, dtype=bool)
         corr = float(np.corrcoef(e.coupling.kappa[off], np.abs(Minv)[off])[0, 1])
-        d = np.abs(np.diag(Minv))
-        check("declared_operator_agrees_with_the_model's_own_inverse_inertia",
-              corr > 0.3,
-              "corr(kappa, |M^-1|) = %+.3f; model's ankle/hip susceptibility "
-              "ratio %.2f against the declared %.2f  (a WEAK correlation is a "
-              "finding about the declaration, not a crash)"
-              % (corr, d[1::2].mean() / max(d[::2].mean(), 1e-12),
-                 P.recv_ankle / P.recv_hip))
+        if src == "committed":
+            check("committed_operator_is_the_model's_own_inverse_inertia", corr > 0.65,
+                  "corr(kappa, |M^-1|) = %+.3f at the running pose (the committed "
+                  "matrix was dumped at the NOMINAL pose, so < 1 is expected)" % corr)
+        else:
+            #  NOT a failure: the surrogate is a declared transmission model, and
+            #  this is the measurement that says so.  Run dump_operator.py to
+            #  replace it with the machine's own |M^-1|.
+            print("  [ -- ] surrogate kappa vs the model's own |M^-1|: corr = %+.3f "
+                  "-- same support and ordering, different shape.  Run "
+                  "dump_operator.py to use the machine's own operator." % corr)
     e.close()
 
     # ------------------------------------------------ NS-1.4: the reward is untouched

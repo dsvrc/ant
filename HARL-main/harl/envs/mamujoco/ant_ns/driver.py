@@ -138,13 +138,18 @@ class DialParams:
     length_scale: float = 0.25
     """Transmission length scale, in metres: ``ant.xml``'s own torso radius.  A
     published number from the model file."""
-    recv_hip: float = 0.7
-    recv_ankle: float = 1.3
-    """Receiver susceptibility by joint type, normalised to mean 1.  Declared
-    from the drivetrain (a hip reacts against the whole leg's inertia, an ankle
-    against the foot's), and what makes the operator asymmetric.  ``layer.py``
-    prints the model's own inverse-inertia diagonal ratio beside these at
-    startup, so the declaration is checked rather than asserted."""
+    recv_spread: float = 0.35
+    """Spread of the per-actuator receiver susceptibility, normalised to mean 1.
+
+    A DECLARED heterogeneity of the hardware -- no two drivetrains on a real
+    machine are identical, and the unit that has done more work is more easily
+    thrown about by the same trunk reaction.  It is what makes the operator
+    ASYMMETRIC, since the transmission structure itself is symmetric either way.
+
+    It is NOT claimed to be measurable in this simulator.  An earlier version
+    declared a hip/ankle ratio of 1.86 on the argument that an ankle carries
+    only the foot; the model was asked and answered 1.01, so the argument was
+    wrong and was removed rather than defended.  See ``structure.recv_vector``."""
 
     # -- the declared classes (P-1.1, P-1.2) --------------------------------------
     send_hh: float = 1.5

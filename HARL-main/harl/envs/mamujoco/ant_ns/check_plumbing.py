@@ -154,6 +154,9 @@ def main():
     check("get_task_name_knows_mamujoco_ns",
           'mamujoco_ns' in _read("harl/utils/configs_tools.py"))
     check("train.py_accepts_mamujoco_ns", '"mamujoco_ns"' in train)
+    check("host_guard_is_armed_in_the_yaml",
+          int(cfg.get("ns_allow_patched_host", 0)) == 0,
+          "ns_allow_patched_host=1 makes a run unreportable -- it must be 0 for anything that goes in the paper")
     check("mamujoco_yaml_is_untouched",
           "ns_" not in _read("harl/configs/envs_cfgs/mamujoco.yaml"),
           "the eight other mamujoco method families must not inherit a dial")

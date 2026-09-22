@@ -57,7 +57,9 @@ from .coupling import Coupling
 from .driver import DialParams, ThermalDriver
 #: kept mujoco-free so ``check_plumbing.py`` can read it without a simulator
 from .keys import NS_KWARGS
-from .structure import (N_JOINTS, describe, model_inverse_inertia, verify_against_model)
+from .structure import (N_JOINTS, describe, kernel_source, model_inverse_inertia,
+                        verify_against_model, verify_host_is_stock,
+                        verify_operator_against_model)
 
 __all__ = ["SeverityMixin", "NS_KWARGS", "make_ant_ns_env"]
 
@@ -109,8 +111,7 @@ class SeverityMixin(object):
             mean_preserving=_b(raw.get("ns_mean_preserving", 0)),
             rho=float(raw.get("ns_rho", 0.8)),
             length_scale=float(raw.get("ns_length_scale", 0.25)),
-            recv_hip=float(raw.get("ns_recv_hip", 0.7)),
-            recv_ankle=float(raw.get("ns_recv_ankle", 1.3)),
+            recv_spread=float(raw.get("ns_recv_spread", 0.35)),
             send_hh=float(raw.get("ns_send_hh", 1.5)),
             send_aa=float(raw.get("ns_send_aa", 0.9)),
             send_cross=float(raw.get("ns_send_cross", 0.6)),
@@ -147,7 +148,24 @@ class SeverityMixin(object):
         )
 
         # ---- II.9 gates 1, 3 and 4 -- all abort, none warn ----------------------
-        gates = [verify_against_model(self.env), self.coupling.verify()]
+        #  Gate 0 first, because it invalidates everything downstream: is the
+        #  HOST itself already disturbed?  A patched gym `ant.py` (this repo has
+        #  shipped one) would make `ns_severity: 0` something other than the
+        #  stock task, and every arm would be measured against a disturbed
+        #  baseline -- plausible numbers, wrong experiment.
+        allow_patched = _b(raw.get("ns_allow_patched_host", 0))
+        try:
+            host_note = verify_host_is_stock(self.env)
+        except AssertionError:
+            if not allow_patched:
+                raise
+            host_note = ("host: PATCHED, and ns_allow_patched_host=1 -- THIS RUN IS "
+                         "NOT REPORTABLE AS A SEVERITY ARM")
+            print("[ANT-NS][REFUSE] " + host_note)
+        gates = [host_note, verify_against_model(self.env), self.coupling.verify()]
+        op_note = verify_operator_against_model(self.env)
+        if op_note is not None:
+            gates.append(op_note)
 
         ctrl_range = np.abs(np.asarray(self.env.model.actuator_ctrlrange,
                                        dtype=np.float64)).max(axis=1)
@@ -208,22 +226,26 @@ class SeverityMixin(object):
                   "reference partition's (it is what makes the N-scaling visible), and a "
                   "MISTAKE if the structure changed -- see the README."
                   % (float(committed), computed))
+        src, note = kernel_source()
+        print("[ANT-NS] transmission structure: %s -- %s" % (src.upper(), note))
         Minv = model_inverse_inertia(self.env)
         if Minv is None:
             print("[ANT-NS] the installed mujoco binding exposes no dense mass matrix; "
-                  "the declared operator could not be checked against the model's own "
-                  "inverse inertia (declaration unverified, not wrong)")
+                  "the declared operator could not be compared with the model's own "
+                  "inverse inertia")
         else:
-            K = np.abs(Minv)
             off = ~np.eye(N_JOINTS, dtype=bool)
-            a, b = self.coupling.kappa[off], K[off]
-            corr = float(np.corrcoef(a, b)[0, 1]) if a.std() > 0 and b.std() > 0 else float("nan")
-            hips = np.diag(K)[::2].mean()
-            ankles = np.diag(K)[1::2].mean()
-            print("[ANT-NS] declared operator vs the model's OWN inverse inertia at the "
-                  "nominal pose: corr(kappa, |M^-1|_offdiag) = %+.3f | model's own "
-                  "susceptibility ratio ankle/hip = %.2f against the declared %.2f"
-                  % (corr, ankles / max(hips, 1e-12), self.ns.recv_ankle / self.ns.recv_hip))
+            a_, b_ = self.coupling.kappa[off], np.abs(Minv)[off]
+            corr = (float(np.corrcoef(a_, b_)[0, 1])
+                    if a_.std() > 0 and b_.std() > 0 else float("nan"))
+            msg = ("[ANT-NS] kappa vs the model's OWN inverse inertia at the running "
+                   "pose: corr = %+.3f" % corr)
+            if src == "surrogate" and corr < 0.5:
+                msg += ("   <-- the geometric surrogate has the right support and "
+                        "ordering but NOT the machine's shape.  Run dump_operator.py "
+                        "to use the model's own |M^-1| instead, or say in the paper "
+                        "that W is a declared transmission model.")
+            print(msg)
         print("[ANT-NS] sigma=%.3f on=%d direct(B)=%d | pact=%d trust=%s g=%.2f oracle=%d "
               "intercept_only=%d mu=%.4f p0=%.1f warmup=%d | load_norm %s | clock0=%d | "
               "observe_residual=%d"

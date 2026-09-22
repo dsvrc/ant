@@ -11,7 +11,7 @@ NS_KWARGS = (
     "ns_on", "ns_severity", "ns_period", "ns_warm_fraction", "ns_loss_at_sigma1",
     "ns_mean_preserving", "ns_phase0",
     # the medium and the declared classes
-    "ns_rho", "ns_length_scale", "ns_recv_hip", "ns_recv_ankle",
+    "ns_rho", "ns_length_scale", "ns_recv_spread",
     "ns_send_hh", "ns_send_aa", "ns_send_cross",
     "ns_y_clip", "ns_corr_clip", "ns_load_norm",
     # the (B) control
@@ -21,6 +21,8 @@ NS_KWARGS = (
     "ns_mu", "ns_p0", "ns_warmup", "ns_p_trace_max",
     # ablation: hand the policy its own residual
     "ns_observe_residual",
+    # escape hatch for an already-disturbed host; never for a reported run
+    "ns_allow_patched_host",
 )
 
 #: keys the runner sets; a yaml that sets them non-default is a misconfiguration
@@ -28,7 +30,7 @@ RUNNER_KEYS = ("ns_pact", "ns_trust", "ns_oracle", "ns_intercept_only")
 
 #: DialParams field -> yaml key (all are ns_<field>)
 DIAL_FIELDS = ("severity", "period", "warm_fraction", "loss_at_sigma1", "mean_preserving",
-               "rho", "length_scale", "recv_hip", "recv_ankle", "send_hh", "send_aa",
+               "rho", "length_scale", "recv_spread", "send_hh", "send_aa",
                "send_cross", "y_clip", "corr_clip", "direct")
 
 #: PactConfig field -> yaml key

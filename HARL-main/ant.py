@@ -5,12 +5,10 @@ from gym.envs.mujoco import mujoco_env
 
 class AntEnv(mujoco_env.MujocoEnv, utils.EzPickle):
     def __init__(self):
-        print("dsvrc 1")
         mujoco_env.MujocoEnv.__init__(self, "ant.xml", 5)
         utils.EzPickle.__init__(self)
 
     def step(self, a):
-        print("dsvrc 1")
         xposbefore = self.get_body_com("torso")[0]
         self.do_simulation(a, self.frame_skip)
         xposafter = self.get_body_com("torso")[0]

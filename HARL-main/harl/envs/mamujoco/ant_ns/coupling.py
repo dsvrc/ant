@@ -71,7 +71,7 @@ class Coupling(object):
         self.n = len(self.parts)
         self.owner = agent_of(self.parts)                      # (8,)
         self.dims = [len(g) for g in self.parts]
-        self.recv = recv_vector(p.recv_hip, p.recv_ankle)      # (8,)
+        self.recv = recv_vector(p.recv_spread)                 # (8,)
         self.kappa = kernel(p.length_scale)                    # (8, 8)
 
         # ---- the declared operator, one (8, 8) matrix per load path ----------
@@ -266,11 +266,11 @@ class Coupling(object):
     def banner(self, load_norm=None, ref=None, scale=None):
         st = self.operator_stats()
         return ("[ANT-NS] coupling  %s  N=%d dims=%s  r=%d classes=(hip<-hip, ankle<-ankle, "
-                "cross)  L=%.2f rho=%.2f  recv=[hip %.2f, ankle %.2f]  send(unknown)=%s\n"
+                "cross)  L=%.2f rho=%.2f  recv in [%.2f, %.2f]  send(unknown)=%s\n"
                 "[ANT-NS]           W: zero_diag=%s spread=%.3f ratio=%.1fx asym=%.3f links=%d  "
                 "| load_norm=%s ref=%s scale=%s"
                 % (self.agent_conf, self.n, self.dims, self.r, self.p.length_scale,
-                   self.p.rho, self.p.recv_hip, self.p.recv_ankle,
+                   self.p.rho, float(self.recv.min()), float(self.recv.max()),
                    np.round(self.send, 3).tolist(),
                    st["diag_max"] == 0.0, st["spread"], st["ratio"], st["asymmetry"],
                    st["n_links"],
@@ -291,7 +291,7 @@ class _LoneCoupling(Coupling):
         self.n = 1
         self.owner = np.zeros(N_JOINTS, dtype=np.int64)
         self.dims = [N_JOINTS]
-        self.recv = recv_vector(p.recv_hip, p.recv_ankle)
+        self.recv = recv_vector(p.recv_spread)
         self.kappa = kernel(p.length_scale)
         self.G = np.zeros((self.r, N_JOINTS, N_JOINTS))        # the peer mask is empty
         self.W = self.G.sum(axis=0)

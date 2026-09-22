@@ -102,10 +102,12 @@ ns_phase0: 0             # clock origin; rollout threads are de-phased from it
 # -- the medium and the declared classes --------------------------------------
 ns_rho: 0.8              # trunk memory: compliance and backlash integrate
 ns_length_scale: 0.25    # ant.xml's OWN torso radius (published geometry)
-ns_recv_hip: 0.7         # receiver susceptibility by joint type: an ankle carries
-ns_recv_ankle: 1.3       #   only the foot, so the same reaction throws it further.
-                         #   The startup banner prints the model's own inverse-
-                         #   inertia ratio next to these.
+ns_recv_spread: 0.35     # DECLARED per-actuator heterogeneity (build tolerance and
+                         #   wear), mean 1.  This is what makes the operator
+                         #   asymmetric -- the transmission structure itself is
+                         #   symmetric.  NOT measurable in this simulator: Ant's
+                         #   four legs are identical and the model's own
+                         #   inverse-inertia diagonal ratio measures 1.01.
 ns_send_hh: 1.5          # beta* per load path, normalised to mean 1.  UNKNOWN to
 ns_send_aa: 0.9          #   the agent; what the estimator must recover.  Hips bolt
 ns_send_cross: 0.6       #   straight to the trunk and load each other hardest.
@@ -113,7 +115,10 @@ ns_y_clip: 10.0          # P-2.1 declared sensor bound; clip_frac is reported
 ns_corr_clip: 0.5        # relief valve: the feed-forward never exceeds half the
                          #   torque range (closes trap 11 -- a diverged estimate
                          #   scoring well by accident through a saturating kick)
-ns_load_norm: 0.337038   # COMMITTED from ceiling.py at the 4x2 REFERENCE partition.
+ns_load_norm: 0.471754   # COMMITTED from ceiling.py at the 4x2 REFERENCE partition.
+                         #   RE-RUN ceiling.py and update this whenever the operator
+                         #   changes -- in particular after dump_operator.py replaces
+                         #   the geometric surrogate with the machine's own |M^-1|.
                          #   Deliberately NOT recomputed per partition: at 8x1 the
                          #   same sigma delivers more because there ARE more peers,
                          #   and that is the N-scaling prediction rather than a
@@ -141,3 +146,13 @@ ns_p_trace_max: 100.0    # covariance windup bound (trap 7); 0 disables
 
 # -- ablation: hand every arm's policy its own residual (obs +1) ---------------
 ns_observe_residual: 0
+
+# -- the host guard -----------------------------------------------------------
+ns_allow_patched_host: 0 # the layer ABORTS if the installed gym `ant.py` carries
+                         #   a coupling of its own (this repo has shipped such a
+                         #   diagnostic env: it announces itself with a
+                         #   `[DIAG ENV] SEVERITY=...` banner).  Stacking two
+                         #   couplings would make `ns_severity: 0` something other
+                         #   than the stock task and every ladder would be measured
+                         #   against a disturbed baseline.  Set to 1 ONLY to
+                         #   experiment; such a run is NOT reportable.
