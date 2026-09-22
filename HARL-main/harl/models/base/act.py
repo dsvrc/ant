@@ -41,6 +41,31 @@ class ACTLayer(nn.Module):
                 )
             self.action_outs = nn.ModuleList(action_outs)
 
+
+    def _dist(self, x, available_actions=None, logit_bias=None):
+        """Build the action distribution, passing ``logit_bias`` ONLY when there
+        is one.
+
+        ``Categorical.forward`` accepts a logit bias -- that is SMAC-NS's
+        steering channel, which shifts the logits inside the softmax.  A Gaussian
+        head has no logits to shift, so ``DiagGaussian.forward`` takes no such
+        argument, and passing it unconditionally raised `TypeError: forward()
+        takes from 2 to 3 positional arguments but 4 were given` on EVERY
+        continuous-action task in the repo (mamujoco, LAG, continuous MPE) the
+        moment the first action was drawn.
+
+        A non-None bias on a continuous head is a wiring error rather than
+        something to drop quietly, so it raises with the reason."""
+        if logit_bias is None:
+            return self.action_out(x, available_actions)
+        if self.action_type != "Discrete":
+            raise TypeError(
+                "a logit bias was supplied for a %s action space.  Shifting logits "
+                "inside a softmax is only meaningful for a discrete head; a "
+                "continuous channel compensates in the action space instead (see "
+                "harl/envs/mamujoco/ant_ns)." % self.action_type)
+        return self.action_out(x, available_actions, logit_bias)
+
     def forward(self, x, available_actions=None, deterministic=False,
                 logit_bias=None):
         """Compute actions and action logprobs from given input.
@@ -72,7 +97,7 @@ class ACTLayer(nn.Module):
                 dim=-1, keepdim=True
             )
         else:
-            action_distribution = self.action_out(x, available_actions, logit_bias)
+            action_distribution = self._dist(x, available_actions, logit_bias)
             actions = (
                 action_distribution.mode()
                 if deterministic
@@ -97,7 +122,7 @@ class ACTLayer(nn.Module):
                 action_distribution = action_out(x, available_actions)
                 action_logits.append(action_distribution.logits)
         else:
-            action_distribution = self.action_out(x, available_actions, logit_bias)
+            action_distribution = self._dist(x, available_actions, logit_bias)
             action_logits = action_distribution.logits
 
         return action_logits
@@ -142,7 +167,7 @@ class ACTLayer(nn.Module):
             )
             return action_log_probs, dist_entropy, None
         else:
-            action_distribution = self.action_out(x, available_actions, logit_bias)
+            action_distribution = self._dist(x, available_actions, logit_bias)
             action_log_probs = action_distribution.log_probs(action)
             if active_masks is not None:
                 if self.action_type == "Discrete":

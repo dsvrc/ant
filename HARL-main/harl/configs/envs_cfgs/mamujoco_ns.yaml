@@ -86,7 +86,15 @@ episode_limit: 1000
 #  the dial -- TASK PHYSICS (NS-3.1), so every algorithm runs inside it
 # =============================================================================
 ns_on: 1                 # 1 = the layer is in; 0 = stock Ant (B0)
-ns_severity: 1.0         # sigma.  EXACTLY inert at 0.0.  PLACEHOLDER -- see above.
+ns_severity: 2.0         # sigma.  EXACTLY inert at 0.0.
+                         #   PROVISIONAL, pending calibrate.py against a trained B0.
+                         #   sigma = 2 is a BEYOND-PHYSICAL stress test and must be
+                         #   labelled so in every table and figure.  Chosen because
+                         #   ceiling.py puts the median |d| at 0.129 of the torque
+                         #   range there (q75 0.220, max 0.695) with only 1.1% of
+                         #   draws above the relief valve -- enough to bite, not
+                         #   enough to saturate the compensator.  Replace with the
+                         #   calibrated row and commit the ladder beside it.
 
 # -- the driver: A(t), a sin^2 bump that is EXACTLY zero for the cold half -----
 ns_period: 20000         # ~17 min at dt = 0.05 s, the time scale a drivetrain
