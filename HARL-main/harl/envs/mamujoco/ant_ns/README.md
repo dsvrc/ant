@@ -229,32 +229,40 @@ ships no scripted gait, and a random policy has nothing to lose). Host flags are
 export TUNED="--n_rollout_threads 20 --num_env_steps 10000000 --episode_length 200 --hidden_sizes 128,128,128 --ppo_epoch 5 --critic_epoch 5 --actor_num_mini_batch 1 --critic_num_mini_batch 1 --entropy_coef 0 --share_param False --fixed_order False"
 ```
 ```bash
-for S in 1 2 3; do python examples/train.py --algo happo --env mamujoco_ns --exp_name b0 --ns_on 0 --seed $S $TUNED; done
+for S in 1 2 3; do python examples/train.py --algo mappo --env mamujoco_ns --exp_name b0 --ns_on 0 --seed $S $TUNED; done
 ```
 
 **5. Calibrate σ against B0, then commit the operating point.**
 
 ```bash
-python -m harl.envs.mamujoco.ant_ns.calibrate --run_dir results/mamujoco_ns/Ant-v2-4x2/happo/b0/seed-00001-<stamp> --sigmas 0,0.25,0.5,1,1.5,2,3 --episodes 20 --threads 10 --phase peak --out ladder_peak.json
+python -m harl.envs.mamujoco.ant_ns.calibrate --run_dir results/mamujoco_ns/Ant-v2-4x2/mappo/b0/seed-00001-<stamp> --sigmas 0,0.25,0.5,1,1.5,2,3 --episodes 20 --threads 10 --phase peak --out ladder_peak.json
 ```
 
 Run it again with `--phase cycle --out ladder_cycle.json` (the cycle average is
 what training sees), then commit the chosen `ns_severity` and the table into
 `mamujoco_ns.yaml`.
 
-**6. The arms.** Five, through the identical layer (P-9.1). `blind` is
-`--algo happo` inside the dial; `pactoff` is provably bit-identical to it and
-additionally writes the panel.
+**6. The arms.** Five, through the identical layer (P-9.1). **Each arm's
+runner matches its actor**: the five spec arms are MAPPO-hosted, so `--algo
+mappo` is their blind baseline, and `pactoff` is provably bit-identical to it
+while additionally writing the panel.
 
 ```bash
-for A in happo pactoff pact pact_oracle pact_intercept; do python examples/train.py --algo $A --env mamujoco_ns --exp_name $A --seed 1 $TUNED; done
+for A in mappo pactoff pact pact_oracle pact_intercept; do python examples/train.py --algo $A --env mamujoco_ns --exp_name $A --seed 1 $TUNED; done
+```
+
+Then the same pair on the HAPPO host, which is what shows the result is not an
+artefact of one learner:
+
+```bash
+for A in happo pact_happo_off pact_happo; do python examples/train.py --algo $A --env mamujoco_ns --exp_name ${A}_h --seed 1 $TUNED; done
 ```
 
 **7. The existing algorithms, inside the identical physics.** These are what
 should fall.
 
 ```bash
-for A in mappo hatrpo haa2c; do python examples/train.py --algo $A --env mamujoco_ns --exp_name ${A}_ns --seed 1 $TUNED; done
+for A in hatrpo haa2c; do python examples/train.py --algo $A --env mamujoco_ns --exp_name ${A}_ns --seed 1 $TUNED; done
 ```
 
 **8. The (B) control** — the pair the classification rests on.
@@ -269,7 +277,14 @@ python examples/train.py --algo pact_intercept --env mamujoco_ns --exp_name inte
 **9. The N-scaling, as training runs (NS-4.2).**
 
 ```bash
-for C in 2x4 4x2 8x1; do for A in pactoff pact; do python examples/train.py --algo $A --env mamujoco_ns --exp_name ${A}_$C --agent_conf $C --seed 1 $TUNED; done; done
+for C in 2x4 4x2; do for A in pactoff pact; do python examples/train.py --algo $A --env mamujoco_ns --exp_name ${A}_$C --agent_conf $C --seed 1 $TUNED; done; done
+```
+
+`8x1` is the **null control** — the coupling share is already 100 % at `4x2`, so
+it should show no further change:
+
+```bash
+for A in pactoff pact; do python examples/train.py --algo $A --env mamujoco_ns --exp_name ${A}_8x1 --agent_conf 8x1 --seed 1 $TUNED; done
 ```
 
 **10. Ablations.**

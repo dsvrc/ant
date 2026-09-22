@@ -138,6 +138,20 @@ def main():
         check("%s_has_an_algo_yaml" % name,
               os.path.exists(os.path.join(ROOT, "harl/configs/algos_cfgs/%s.yaml" % name)))
         check("%s_is_in_the_actor_registry" % name, ('"%s":' % name) in actors)
+    #  the pairing that cost a launch: a MAPPO actor under the HAPPO runner runs
+    #  HAPPO's factor update around an actor that ignores the factor
+    host_of = dict(re.findall(r'"([a-z_]+)": _mk\("[a-z]+", (OnPolicy[MH]ARunner)\)',
+                              runner_src))
+    actor_of = dict(re.findall(r'"([a-z_0-9]+)": (HAPPO|MAPPO),', actors))
+    bad = [(n, host_of[n], actor_of.get(n))
+           for n in host_of
+           if actor_of.get(n) and
+           (actor_of[n] == "HAPPO") != (host_of[n] == "OnPolicyHARunner")]
+    check("every_arm's_runner_matches_its_actor", not bad,
+          "mismatched: %s" % bad if bad else
+          "%d arms: %s" % (len(host_of),
+                           ", ".join("%s=%s/%s" % (n, actor_of.get(n), host_of[n][8:])
+                                     for n in sorted(host_of))))
     check("mamujoco_ns_branch_in__pact_runner", 'args["env"] == "mamujoco_ns"' in reg)
     check("ANT_ARMS_is_imported_by_the_registry", "from harl.runners.on_policy_ant_ns_runner "
           "import ANT_ARMS" in reg)

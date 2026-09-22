@@ -248,14 +248,27 @@ def _mk(arm, host):
     return type("PactAnt_%s_%s" % (arm, host.__name__), (PactAntMixin, host), dict(arm=arm))
 
 
-# HAPPO host (the standard MAMuJoCo baseline) and MAPPO host.
+#  EACH ARM'S RUNNER MUST MATCH ITS ACTOR, and that is not bookkeeping.
+#
+#  ``harl/algorithms/actors/__init__.py`` maps `pact`, `pactoff`, `pact_fixed`,
+#  `pact_oracle` and `pact_intercept` to the MAPPO actor, and `pact_happo` /
+#  `pact_happo_off` to HAPPO.  Pairing a MAPPO actor with ``OnPolicyHARunner``
+#  runs HAPPO's sequential factor update around an actor whose ``update`` never
+#  reads the factor: it does not crash, it just quietly trains something that is
+#  neither HAPPO nor MAPPO -- and then an arm difference IS an algorithm
+#  difference, which P-9.1 exists to prevent.  ``check_plumbing.py`` now asserts
+#  this pairing for every arm.
+#
+#  So: the five spec arms run on the MAPPO host (matching `--algo mappo` as the
+#  blind baseline), and `pact_happo` / `pact_happo_off` are the HAPPO-hosted pair
+#  (matching `--algo happo`).  Running both pairs is what shows the result is not
+#  an artefact of one host.
 ANT_ARMS = {
-    "pact": _mk("pact", OnPolicyHARunner),
-    "pactoff": _mk("pactoff", OnPolicyHARunner),
-    "pact_fixed": _mk("fixed", OnPolicyHARunner),
-    "pact_oracle": _mk("oracle", OnPolicyHARunner),
-    "pact_intercept": _mk("intercept", OnPolicyHARunner),
+    "pact": _mk("pact", OnPolicyMARunner),
+    "pactoff": _mk("pactoff", OnPolicyMARunner),
+    "pact_fixed": _mk("fixed", OnPolicyMARunner),
+    "pact_oracle": _mk("oracle", OnPolicyMARunner),
+    "pact_intercept": _mk("intercept", OnPolicyMARunner),
     "pact_happo": _mk("pact", OnPolicyHARunner),
     "pact_happo_off": _mk("pactoff", OnPolicyHARunner),
-    "pact_mappo": _mk("pact", OnPolicyMARunner),
 }
