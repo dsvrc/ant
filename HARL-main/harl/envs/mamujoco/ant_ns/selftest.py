@@ -23,8 +23,8 @@ from .channel import BoundedRLS, PactConfig, TrunkChannel
 from .coupling import Coupling, _LoneCoupling
 from .driver import DialParams, ThermalDriver
 from .structure import (ANCHORS, CLASS_NAMES, JOINT_IS_HIP, LEG_OF, N_JOINTS,
-                        PARTITIONS, RUNNABLE, class_of, kernel, partition_of,
-                        recv_vector)
+                        PARTITIONS, RUNNABLE, class_of, kernel, kernel_source,
+                        partition_of, recv_vector)
 
 FAILS = []
 P = DialParams()
@@ -128,13 +128,26 @@ def t_operator():
           "ctrl pairs are (hip, ankle) of legs %s, ankles further out"
           % list(LEG_OF[::2]))
     K = kernel(p.length_scale)
-    same_leg = K[0, 1]
-    adjacent = K[0, 2]
-    diagonal = K[0, 4]
-    check("kernel_orders_the_load_paths_by_geometry",
-          same_leg > adjacent > diagonal,
-          "own ankle %.3f > adjacent leg's hip %.3f > diagonal leg's hip %.3f"
-          % (same_leg, adjacent, diagonal))
+    src, _ = kernel_source()
+    if src == "surrogate":
+        #  the SURROGATE is a distance falloff, so it must order by distance
+        check("surrogate_kernel_orders_the_load_paths_by_distance",
+              K[0, 1] > K[0, 2] > K[0, 4],
+              "own ankle %.3f > adjacent hip %.3f > diagonal hip %.3f"
+              % (K[0, 1], K[0, 2], K[0, 4]))
+    else:
+        #  the COMMITTED operator is the machine's own |M^-1|, and it does NOT
+        #  order by distance -- measured on Ant: hips load hips (adjacent 4.38 >
+        #  diagonal 2.82), ankles load ankles the OTHER way round (diagonal 1.80
+        #  >> adjacent 0.31, because diagonal legs have parallel ankle axes), and
+        #  the cross path is EXACTLY zero at the nominal pose.  Asserting the
+        #  distance ordering here would be asserting the surrogate's prejudice
+        #  against the machine's own dynamics.
+        check("committed_kernel_has_the_machine's_own_structure",
+              K[0, 1] == 0.0 and K[0, 2] > K[0, 4] > 0 and K[1, 5] > K[1, 3] > 0,
+              "cross %.3f == 0; hips adjacent %.3f > diagonal %.3f; ankles "
+              "diagonal %.3f > adjacent %.3f"
+              % (K[0, 1], K[0, 2], K[0, 4], K[1, 5], K[1, 3]))
     check("classes_are_independent_of_the_partition",
           len({Coupling(k, p, drv.send).r for k in RUNNABLE}) == 1
           and Coupling("8x1", p, drv.send).r == len(CLASS_NAMES),
@@ -169,6 +182,15 @@ def t_operator():
              np.round(scale, 3).tolist()))
     ln = c.load_norm(samples=512)
     check("load_norm_is_positive", ln > 0.05, "load_norm=%.4f" % ln)
+    #  P-3.4: pruning must keep every downstream index aligned
+    psi = c.design(np.zeros((c.n, c.r)), ref, scale)
+    check("channel_pruning_keeps_everything_aligned",
+          psi.shape[1] == 1 + c.r_live and len(c.live) + len(c.pruned) == c.r
+          and all(c.share[m] < 0.001 for m in c.pruned),
+          "psi has 1 + %d columns; live=%s pruned=%s (shares %s)"
+          % (c.r_live, [CLASS_NAMES[m] for m in c.live],
+             [CLASS_NAMES[m] for m in c.pruned] or "none",
+             np.round(c.share, 4).tolist()))
     #  every partition must cover every joint exactly once
     cover = all(sorted(j for g in partition_of(k) for j in g) == list(range(N_JOINTS))
                 for k in PARTITIONS)
@@ -495,10 +517,15 @@ def t_end_to_end():
         ch = build(conf, sigma=2.0, clock0=PEAK)
         (A, U, D, _), _ = run(ch, 600, seed=7)
         per_joint[conf] = float(np.abs(D).mean())
-    check("per_actuator_disturbance_rises_with_N",
-          per_joint["2x4"] < per_joint["4x2"] < per_joint["8x1"],
-          "mean |d| per joint: 2x4=%.4f 4x2=%.4f 8x1=%.4f (NS-4.2, and all three "
-          "are runnable)" % (per_joint["2x4"], per_joint["4x2"], per_joint["8x1"]))
+    #  NS-4.2 up to SATURATION.  With the machine's own operator the coupling
+    #  share reaches 100% at 4x2 -- the only pair inside a 4x2 agent is its own
+    #  hip-ankle and that path is exactly zero -- so 8x1 adds nothing, and
+    #  asserting a further rise there would be asserting a wish.
+    check("per_actuator_disturbance_rises_with_N_until_saturation",
+          per_joint["2x4"] < per_joint["4x2"],
+          "mean |d| per joint: 2x4=%.4f -> 4x2=%.4f; 8x1=%.4f (saturated: every "
+          "coupled pair already crosses an agent boundary at 4x2)"
+          % (per_joint["2x4"], per_joint["4x2"], per_joint["8x1"]))
 
     print("  panel at the warm peak (full arm, agent 0): %s"
           % {k: round(v, 4) for k, v in panel.items()

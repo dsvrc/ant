@@ -265,15 +265,22 @@ def main():
     print("NS-4.2 -- the per-actuator disturbance rises with N, in the engine",
           flush=True)
     per = {}
+    #  the committed reference load_norm for EVERY partition: that is the whole
+    #  point of holding it fixed, and letting each partition normalise by its own
+    #  divides the effect out (measured: it inverted the table).
+    _, ea0 = get_defaults_yaml_args("happo", "mamujoco_ns")
+    ln_ref = ea0["ns_load_norm"]
     for conf in ("2x4", "4x2", "8x1"):
-        env = make(conf, ns_severity=2.0, ns_phase0=PEAK)
+        env = make(conf, ns_severity=2.0, ns_phase0=PEAK, ns_load_norm=ln_ref)
         _, _, infos = rollout(env, 7, 200)
         per[conf] = float(np.mean([r["ns_dmax"] for r in infos if "ns_dmax" in r]))
         env.close()
-    check("per_actuator_disturbance_rises_with_N",
-          per["2x4"] < per["4x2"] < per["8x1"],
-          "mean max|d|: 2x4=%.4f 4x2=%.4f 8x1=%.4f -- and all three are runnable "
-          "training configs with the identical dial and basis"
+    check("per_actuator_disturbance_rises_with_N_until_saturation",
+          per["2x4"] < per["4x2"],
+          "mean max|d|: 2x4=%.4f -> 4x2=%.4f; 8x1=%.4f (saturated -- the only pair "
+          "inside a 4x2 agent is its own hip-ankle, and with the machine's own "
+          "operator that path is exactly zero).  All three are runnable configs "
+          "with the identical dial and basis."
           % (per["2x4"], per["4x2"], per["8x1"]))
 
     # ------------------------------------------------------------------ obs tail

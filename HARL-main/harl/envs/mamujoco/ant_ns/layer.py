@@ -57,7 +57,8 @@ from .coupling import Coupling
 from .driver import DialParams, ThermalDriver
 #: kept mujoco-free so ``check_plumbing.py`` can read it without a simulator
 from .keys import NS_KWARGS
-from .structure import (N_JOINTS, describe, kernel_source, model_inverse_inertia,
+from .structure import (N_JOINTS, REFERENCE_PARTITION, describe, kernel_source,
+                        model_inverse_inertia,
                         verify_against_model, verify_host_is_stock,
                         verify_operator_against_model)
 
@@ -221,11 +222,26 @@ class SeverityMixin(object):
         print(self.driver.banner())
         print(self.coupling.banner(self.chan.load_norm, ref, scale))
         if committed is not None and abs(float(committed) - computed) > 0.05 * max(computed, 1e-9):
-            print("[ANT-NS][WARN] committed ns_load_norm=%.6f but this partition's own "
-                  "reference is %.6f.  That is EXPECTED when the committed value is the "
-                  "reference partition's (it is what makes the N-scaling visible), and a "
-                  "MISTAKE if the structure changed -- see the README."
-                  % (float(committed), computed))
+            if str(self.agent_conf) == REFERENCE_PARTITION:
+                #  On the partition the committed value BELONGS to, a mismatch can
+                #  only mean the operator changed underneath it -- and a stale
+                #  load_norm silently rescales the whole dial (measured: 16x, which
+                #  put |d| at 13.3 of a torque range of 1).  Abort.
+                raise AssertionError(
+                    "STALE ns_load_norm: the committed value is %.6f but %s -- the "
+                    "partition it belongs to -- now computes %.6f from the structure "
+                    "in force (%s).  The operator changed; sigma no longer means what "
+                    "the config says.  FIX: re-run\n"
+                    "    python -m harl.envs.mamujoco.ant_ns.ceiling --out "
+                    "harl/envs/mamujoco/ant_ns/ceiling.json\n"
+                    "and copy the load_norm it prints into mamujoco_ns.yaml."
+                    % (float(committed), REFERENCE_PARTITION, computed,
+                       kernel_source()[0]))
+            print("[ANT-NS] committed ns_load_norm=%.6f (the %s reference); this "
+                  "partition's own reference is %.6f.  EXPECTED -- holding the "
+                  "reference fixed is what makes the N-scaling visible rather than "
+                  "normalising it away."
+                  % (float(committed), REFERENCE_PARTITION, computed))
         src, note = kernel_source()
         print("[ANT-NS] transmission structure: %s -- %s" % (src.upper(), note))
         Minv = model_inverse_inertia(self.env)

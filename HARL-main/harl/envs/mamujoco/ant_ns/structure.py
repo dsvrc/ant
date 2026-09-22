@@ -97,7 +97,8 @@ import numpy as np
 
 __all__ = ["JOINT_NAMES", "JOINT_IS_HIP", "ANCHORS", "LEG_OF", "TORSO_RADIUS", "RUNNABLE",
            "N_JOINTS", "N_CLASSES", "CLASS_NAMES", "GEOMETRY_TOL", "OPERATOR_JSON",
-           "PARTITIONS", "class_of", "kernel", "surrogate_kernel", "kernel_source",
+           "PARTITIONS", "REFERENCE_PARTITION", "class_of", "kernel", "surrogate_kernel",
+           "kernel_source",
            "committed_operator", "recv_vector", "partition_of", "agent_of",
            "joint_anchors", "actuated_joint_names", "verify_against_model",
            "verify_host_is_stock", "verify_operator_against_model",
@@ -261,6 +262,12 @@ PARTITIONS = {
 
 #: the partitions MAMuJoCo will actually build an Ant for
 RUNNABLE = ("2x4", "2x4d", "4x2", "8x1")
+
+#: The partition the committed ``ns_load_norm`` belongs to.  A mismatch on THIS
+#: partition means the operator changed and the committed value is stale (the
+#: layer aborts); a mismatch on any other partition is the N-scaling and is
+#: expected (the layer warns).
+REFERENCE_PARTITION = "4x2"
 
 
 def partition_of(agent_conf):
@@ -471,6 +478,7 @@ def describe(length_scale=TORSO_RADIUS):
     src, note = kernel_source()
     K = kernel(length_scale)
     off = K[~np.eye(N_JOINTS, dtype=bool)]
-    return ("joints=%s  kappa=%s: min=%.3f max=%.3f ratio=%.1fx  (%s)"
-            % (list(JOINT_NAMES), src, off.min(), off.max(),
-               off.max() / max(off.min(), 1e-12), note))
+    nz = off[off > 0]
+    return ("joints=%s  kappa=%s: %d/%d live links, min=%.3f max=%.3f ratio=%.1fx  (%s)"
+            % (list(JOINT_NAMES), src, nz.size, off.size, nz.min(), nz.max(),
+               nz.max() / max(nz.min(), 1e-12), note))

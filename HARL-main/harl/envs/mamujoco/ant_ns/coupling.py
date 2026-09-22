@@ -43,10 +43,18 @@ numpy only.  No mujoco.
 
 import numpy as np
 
-from .structure import (N_CLASSES, N_JOINTS, agent_of, class_of, kernel, partition_of,
-                        recv_vector)
+from .structure import (CLASS_NAMES, N_CLASSES, N_JOINTS, agent_of, class_of, kernel,
+                        partition_of, recv_vector)
 
 __all__ = ["Coupling"]
+
+#: P-3.4.  A load path carrying less than this share of the operator's total
+#: weight is DEGENERATE and is dropped from the regressor.  Declared, not tuned.
+#: It is not hypothetical: on the machine's own |M^-1| the CROSS path is
+#: identically zero -- at the nominal pose Ant's hip axes are vertical and its
+#: ankle axes horizontal, so a hip torque accelerates no ankle.  Left in, that
+#: dead column took the design-matrix condition number to 9.3e10.
+MIN_SHARE = 1e-3
 
 _EPS = 1e-12
 
@@ -86,6 +94,26 @@ class Coupling(object):
                     continue
                 self.G[class_of(pp, qq), pp, qq] = self.recv[pp] * self.kappa[pp, qq]
         self.W = self.G.sum(axis=0)                            # (8, 8), zero diagonal
+
+        #  P-3.4 -- prune degenerate channels, and KEEP EVERY DOWNSTREAM INDEX
+        #  ALIGNED when you do.  ``live`` maps regressor column -> class id; the
+        #  PHYSICS keeps every class (a pruned one contributes exactly 0 to the
+        #  disturbance anyway), only the ESTIMATOR's basis shrinks.
+        mass = np.array([float(self.G[m].sum()) for m in range(self.r)])
+        total = float(mass.sum())
+        if total <= 0.0:
+            #  A LONE agent: the peer mask is empty, so every class is dead and
+            #  there is nothing to prune AGAINST.  Keep them all -- the
+            #  disturbance is identically zero here either way, and pruning a
+            #  basis on an empty operator would be pruning on no evidence.
+            self.share = np.zeros(self.r)
+            self.live = list(range(self.r))
+        else:
+            self.share = mass / total
+            self.live = [m for m in range(self.r) if self.share[m] >= MIN_SHARE]
+        self.pruned = [m for m in range(self.r) if m not in self.live]
+        assert self.live, "every load path was pruned -- check the operator"
+        self.r_live = len(self.live)
 
     # ------------------------------------------------------------------ basis
     def step_channels(self, Q_prev, tau_prev):
@@ -142,7 +170,7 @@ class Coupling(object):
         return Q
 
     def design(self, x, ref, scale):
-        """``psi = [1, (x - ref) / scale]``.  ``(n, 1 + r)``.
+        """``psi = [1, (x - ref) / scale]`` over the LIVE classes.  ``(n, 1 + r_live)``.
 
         P-3.3: centre and scale on a geometric reference.  Raw channels carry a
         large common mean against an intercept column of 1; measured on the
@@ -150,7 +178,8 @@ class Coupling(object):
         ~1.3e5, at which the intercept and the class channels trade off and the
         per-class split is unidentifiable even though prediction is fine.
         """
-        z = (np.asarray(x, dtype=np.float64) - ref[None, :]) / np.maximum(scale[None, :], 1e-9)
+        x = np.asarray(x, dtype=np.float64)[:, self.live]
+        z = (x - ref[None, self.live]) / np.maximum(scale[None, self.live], 1e-9)
         return np.concatenate([np.ones((z.shape[0], 1)), z], axis=1)
 
     # ------------------------------------------------------------------ references
@@ -240,7 +269,12 @@ class Coupling(object):
 
     # ------------------------------------------------------------------ report
     def operator_stats(self):
-        """NS-1.2's three properties, measured rather than asserted."""
+        """NS-1.2's three properties, measured rather than asserted.
+
+        Spread and ratio are taken over the LIVE links only.  The committed
+        operator has exact zeros (no hip loads any ankle at the nominal pose), and
+        a ratio against a zero is not a number -- it printed as 4.4e12 before this.
+        """
         off = self.W[self.W > 0]
         den = np.abs(self.W) + np.abs(self.W.T)
         mask = den > 0
@@ -265,11 +299,13 @@ class Coupling(object):
 
     def banner(self, load_norm=None, ref=None, scale=None):
         st = self.operator_stats()
-        return ("[ANT-NS] coupling  %s  N=%d dims=%s  r=%d classes=(hip<-hip, ankle<-ankle, "
-                "cross)  L=%.2f rho=%.2f  recv in [%.2f, %.2f]  send(unknown)=%s\n"
+        return ("[ANT-NS] coupling  %s  N=%d dims=%s  r=%d live=%s pruned=%s  "
+                "L=%.2f rho=%.2f  recv in [%.2f, %.2f]  send(unknown)=%s\n"
                 "[ANT-NS]           W: zero_diag=%s spread=%.3f ratio=%.1fx asym=%.3f links=%d  "
                 "| load_norm=%s ref=%s scale=%s"
-                % (self.agent_conf, self.n, self.dims, self.r, self.p.length_scale,
+                % (self.agent_conf, self.n, self.dims, self.r,
+                   [CLASS_NAMES[m] for m in self.live],
+                   [CLASS_NAMES[m] for m in self.pruned] or "none", self.p.length_scale,
                    self.p.rho, float(self.recv.min()), float(self.recv.max()),
                    np.round(self.send, 3).tolist(),
                    st["diag_max"] == 0.0, st["spread"], st["ratio"], st["asymmetry"],
@@ -295,3 +331,7 @@ class _LoneCoupling(Coupling):
         self.kappa = kernel(p.length_scale)
         self.G = np.zeros((self.r, N_JOINTS, N_JOINTS))        # the peer mask is empty
         self.W = self.G.sum(axis=0)
+        self.share = np.zeros(self.r)
+        self.live = list(range(self.r))
+        self.pruned = []
+        self.r_live = self.r

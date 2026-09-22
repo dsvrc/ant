@@ -43,8 +43,8 @@ every sum runs over `j ≠ i`.
 | object | Ant | check |
 |---|---|---|
 | medium | the trunk every leg is bolted to; element = a joint | — |
-| operator `W[p,q]` | `recv_p · κ(p,q) · 1[agent(p) ≠ agent(q)]`. `κ` is the machine's own nominal-pose `|M⁻¹|` once `dump_operator.py` has been run, else a distance falloff on the published anchors. **zero-diag, spread 0.621, ratio 12.5×, asym 0.194, 48 links** | NS-1.2 |
-| `r` classes | the load path by joint type: **hip←hip / ankle←ankle / cross**. `r = 3`, independent of N *and* of the number of joints | P-1.1 |
+| operator `W[p,q]` | `recv_p · κ(p,q) · 1[agent(p) ≠ agent(q)]`, with `κ` = the machine's OWN nominal-pose `|M⁻¹|` (`operator.json`). **zero-diag, spread 0.805, ratio 29.5×, asym 0.194, 24 live links of 56** | NS-1.2 |
+| `r` classes | the load path by joint type: **hip←hip / ankle←ankle / cross**. `r = 3`, independent of N *and* of the number of joints; **cross is pruned** (P-3.4) because the machine's own operator makes it exactly zero → `r_live = 2` | P-1.1, P-3.4 |
 | `β*` | `σ·L·A(t)·send`, `send = [1.5, 0.9, 0.6]` (mean 1) — what a neighbour's torque on each path costs **today**. Unknown to the agent | P-1.2 |
 | driver `A(t)` | drivetrain thermal state: a `sin²` bump over the warm half of a 20000-step cycle, **exactly 0** for the cold half | NS-1.3, NS-2.5 |
 | harm | an unmodelled torque on the actuators, applied at `do_simulation` — **below the reward** | NS-1.4 |
@@ -69,13 +69,13 @@ The last one is exact only because the channel forms the **net** actuator error
 same number in exact arithmetic and differs by an ulp in floating point, which
 would have cost the ceiling identity.
 
-**Measured offline** (synthetic gait, σ=2, μ=0.99, 4x2): `fit_gain 0.999`,
-`beta_cos 1.000`, `beta_relerr 0.006`, `cond_psi 3.6`. Mean `|executed −
-commanded|` over the warm peak: **blind 0.0568 → pact 0.0043** (13×), intercept
-0.0246, against a disturbance of 0.0582. The (B)/(C) pair, as a ratio of
-residuals `intercept / full`: **(C) 5.70× — the peer channels are load-bearing;
-(B) 0.93× — they carry nothing.** That pair is the measurement the
-classification rests on.
+**Measured offline** (synthetic gait, σ=2, μ=0.99, 4x2, machine's own
+operator): `fit_gain 0.999`, `beta_cos 1.000`, `beta_relerr 0.004`, `cond_psi
+2.6`. Mean `|executed − commanded|` over the warm peak: **blind 0.0456 → pact
+0.0036** (12.7×), intercept 0.0186, against a disturbance of 0.0464. The (B)/(C)
+pair, as a ratio of residuals `intercept / full`: **(C) 5.20× — the peer channels
+are load-bearing; (B) 0.96× — they carry nothing.** That pair is the measurement
+the classification rests on.
 
 ## NS-4.2: the N-scaling is *runnable* here, and that is the headline
 
@@ -87,14 +87,27 @@ alone" and into "requires coordination" **without making the task lossier**:
 | `agent_conf` | N | \|d\| per actuator | machine's coupling crossing an agent boundary |
 |---|---|---|---|
 | `1x8` | 1 | 0.0000 | 0.0 % — a lone agent, structurally |
-| `2x4` | 2 | 0.0447 | 40.1 % |
-| `2x4d` | 2 | 0.0537 | 50.9 % |
-| **`4x2`** | **4** | **0.0566** | **65.6 %** |
-| `8x1` | 8 | 0.0609 | 100.0 % |
+| `2x4` | 2 | 0.0444 | 66.2 % |
+| `2x4d` | 2 | 0.0502 | 67.6 % |
+| **`4x2`** | **4** | **0.0551** | **100.0 %** |
+| `8x1` | 8 | 0.0440 | 100.0 % — **saturated** |
 
-Every row from N=2 down is a **real training config**, so the prediction that the
-coordination gap rises with N is an experiment here, not only an offline curve.
-(`1x8` is the structural N=1 projection — MAMuJoCo builds no one-agent Ant.)
+Every row from N=2 down is a **real training config**, so the prediction is an
+experiment here, not only an offline curve. (`1x8` is the structural N=1
+projection — MAMuJoCo builds no one-agent Ant.)
+
+**It saturates at `4x2`, and the reason is exact.** The only pair of joints
+inside a `4x2` agent is its own hip and its own ankle — and on the machine's own
+operator that load path carries **identically zero** (hip axes are vertical,
+ankle axes are not, so no hip torque accelerates any ankle at the nominal pose).
+So by `4x2` every coupled pair already crosses an agent boundary, and `8x1` can
+add nothing. That makes `8x1` a **control with a sharp prediction — no further
+change** — which is a stronger claim than "more agents is worse", and the
+informative range of the experiment is `2x4` → `4x2` (66 % → 100 %).
+
+`ceiling.py` asserts the coupling share is non-decreasing and that `|d|` rises
+with it *up to saturation*; it prints the saturation point rather than
+pretending the curve continues.
 
 > Read `|d|` **per actuator**, never per agent. The per-agent vector norm grows
 > with the number of joints an agent owns, so the per-agent number *falls* with
@@ -355,21 +368,43 @@ distances**, so that is what the gate compares: radii agree to 2 %, distances to
 adjacent leg 0.288 > diagonal leg 0.164). Comparing world-frame coordinates
 fails on a robot that is entirely correct, and did.
 
-## The operator: surrogate now, the machine's own after one command
+## The operator is the machine's own — and it is not what a proxy would guess
 
-`κ` ships as a distance falloff on the published anchor geometry. Measured
-against the machine's own cross-inertia on your Ant, that surrogate correlates
-only **+0.19** — same support, same ordering, different shape. So it is a
-declared transmission *model*, not the machine's own sensitivity.
+`κ` is the joint-space inverse inertia `|M⁻¹|` at the nominal pose, read out of
+the model by `dump_operator.py` and committed as `operator.json`. It is literally
+"how much does a unit torque at q accelerate p" — the mechanical counterpart of
+POWER's PTDF and URB's incidence-over-capacity — so the injected disturbance
+amplifies the machine's **own** coupling rather than laying a differently-shaped
+one on top. The layer re-checks it against the live model at startup
+(measured: corr **+0.999**).
 
-`dump_operator.py` replaces it with the real thing: the joint-space inverse
-inertia `|M⁻¹|` at the nominal pose, which is literally "how much does a unit
-torque at q accelerate p" — the mechanical counterpart of POWER's PTDF and
-URB's incidence-over-capacity. Run it once where MuJoCo is installed, and the
-injected disturbance then amplifies the machine's **own** coupling rather than
-laying a differently-shaped one on top. The banner always says which is in
-force, and the layer re-checks a committed operator against the live model at
-startup.
+It was worth going and getting, because the machine's structure is not what the
+obvious geometric proxy predicts:
+
+| path | measured `|M⁻¹|` | a distance proxy would say |
+|---|---|---|
+| hip ← hip, adjacent legs | **4.382** | strong ✓ |
+| hip ← hip, diagonal legs | **2.823** | weaker ✓ |
+| ankle ← ankle, **diagonal** legs | **1.795** | weakest ✗ |
+| ankle ← ankle, adjacent legs | **0.309** | stronger ✗ |
+| **cross** (hip ↔ ankle, incl. same leg) | **0.000** | *strongest* ✗✗ |
+
+Diagonal legs have **parallel** ankle axes, so they couple 5.8× more strongly
+than adjacent ones — the opposite of the distance ordering. And the cross path,
+which a proximity kernel rates highest of all (a leg's own hip and ankle are the
+closest pair on the robot), is exactly zero. The geometric surrogate correlates
+only **+0.19** with this; it is kept in `structure.py` only as the offline
+fallback, and a run on it must be described as using a declared transmission
+*model* rather than the machine's own sensitivity.
+
+## P-3.4: the cross path is pruned, and it had to be
+
+A class carrying less than `MIN_SHARE = 1e-3` of the operator's weight is
+dropped from the regressor (the physics keeps it — it contributes exactly zero
+anyway). On Ant that is the cross path, and leaving it in was not cosmetic: a
+dead column took the design matrix to `cond_psi = 9.3e10`, `scale = 0.0`, and
+the placebo-reacquisition check to `fit_gain = -0.150`. With it pruned,
+`r_live = 2`, `cond_psi = 2.6`, and reacquisition returns `fit_gain = 0.999`.
 
 ## Honest limits
 
@@ -398,12 +433,19 @@ startup.
    it is a property of real hardware asserted here to give the operator its
    asymmetry. Say so. (The version of this claim the model refuted is recorded
    above rather than quietly deleted.)
-6. **Until `dump_operator.py` is run, `κ` is a declared transmission model**
-   that correlates +0.19 with the machine's own cross-inertia. The story
-   ("the trunk transmits") is unaffected — the support and the ordering are
-   right — but "the operator is the robot's own sensitivity" may only be
-   claimed after the dump.
-7. **`ns_load_norm` is committed at the `4x2` reference partition** and is
+6. **`operator.json` is machine-specific.** The one in the repo reproduces the
+   dumping machine's `load_norm` to 2e-6, but re-run `dump_operator.py` after
+   any sync so the operator is the one your MuJoCo actually has; the banner
+   prints its provenance every run. Without it the layer falls back to the
+   geometric surrogate, which correlates only +0.19 — usable, but then W is a
+   declared transmission *model*, not the machine's own sensitivity, and the
+   paper must say which was used.
+7. **A stale `ns_load_norm` silently rescales the whole dial.** Changing the
+   operator changes it (surrogate 0.4718 → machine's own 7.7255, a 16× jump
+   that put `|d|` at 13.3 of a torque range of 1 before it was caught). The
+   layer now **aborts** when the committed value disagrees with the reference
+   partition's own, and only warns on other partitions where a difference is
+   the N-scaling. It is committed at the `4x2` reference partition** and is
    deliberately *not* recomputed per partition: at `8x1` the same σ delivers
    more because there **are** more peers, which is the N-scaling prediction
    rather than a change of dial. The layer prints both and warns.

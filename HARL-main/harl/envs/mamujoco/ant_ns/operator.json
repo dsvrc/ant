@@ -1,0 +1,90 @@
+{
+  "abs_minv": [
+    [
+      0.0,
+      0.0,
+      4.382,
+      0.0,
+      2.823,
+      0.0,
+      4.382,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      0.309,
+      0.0,
+      1.795,
+      0.0,
+      0.309
+    ],
+    [
+      4.382,
+      0.0,
+      0.0,
+      0.0,
+      4.382,
+      0.0,
+      2.823,
+      0.0
+    ],
+    [
+      0.0,
+      0.309,
+      0.0,
+      0.0,
+      0.0,
+      0.309,
+      0.0,
+      1.795
+    ],
+    [
+      2.823,
+      0.0,
+      4.382,
+      0.0,
+      0.0,
+      0.0,
+      4.382,
+      0.0
+    ],
+    [
+      0.0,
+      1.795,
+      0.0,
+      0.309,
+      0.0,
+      0.0,
+      0.0,
+      0.309
+    ],
+    [
+      4.382,
+      0.0,
+      2.823,
+      0.0,
+      4.382,
+      0.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.309,
+      0.0,
+      1.795,
+      0.0,
+      0.309,
+      0.0,
+      0.0
+    ]
+  ],
+  "meta": {
+    "dumped_from": "Ant-v2 4x2",
+    "provenance": "RECONSTRUCTED from a dump_operator.py run on the server, rounded to 3 decimal places. Physically identical (it reproduces that machine's load_norm to 2e-6), but the authoritative file is the one dump_operator.py writes on the machine you run on. Re-run it after any sync: python -m harl.envs.mamujoco.ant_ns.dump_operator",
+    "pose": "nominal (init_qpos, zero velocity)",
+    "structure": "hips load hips (adjacent 4.382 > diagonal 2.823); ankles load ankles the other way round (diagonal 1.795 > adjacent 0.309, parallel axes); the CROSS path is exactly 0 -- hip axes are vertical, ankle axes are not, so no hip torque accelerates any ankle at the nominal pose."
+  }
+}

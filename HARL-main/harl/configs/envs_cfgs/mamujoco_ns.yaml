@@ -115,7 +115,8 @@ ns_y_clip: 10.0          # P-2.1 declared sensor bound; clip_frac is reported
 ns_corr_clip: 0.5        # relief valve: the feed-forward never exceeds half the
                          #   torque range (closes trap 11 -- a diverged estimate
                          #   scoring well by accident through a saturating kick)
-ns_load_norm: 0.471754   # COMMITTED from ceiling.py at the 4x2 REFERENCE partition.
+ns_load_norm: 7.725505   # COMMITTED from ceiling.py at the 4x2 REFERENCE partition,
+                         #   with the MACHINE'S OWN operator (operator.json) in force.
                          #   RE-RUN ceiling.py and update this whenever the operator
                          #   changes -- in particular after dump_operator.py replaces
                          #   the geometric surrogate with the machine's own |M^-1|.

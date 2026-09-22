@@ -128,7 +128,10 @@ class TrunkChannel(object):
         self.pact = pact
         self.n = int(coupling.n)
         self.r = int(coupling.r)
-        self.dim = 1 if pact.intercept_only else 1 + self.r
+        #  P-3.4: the regressor spans the LIVE classes only.  A degenerate load
+        #  path still exists in the physics (contributing exactly 0); leaving its
+        #  dead column in the design matrix is what took cond_psi to 9.3e10.
+        self.dim = 1 if pact.intercept_only else 1 + int(coupling.r_live)
         self.clock = int(clock0)
         self.ctrl_range = np.broadcast_to(
             np.asarray(ctrl_range, dtype=np.float64), (N_JOINTS,)).copy()
@@ -394,9 +397,15 @@ class TrunkChannel(object):
         if self.pact.intercept_only:
             return None
         if self.p.direct:
-            return np.concatenate([[self.amp], np.zeros(self.r)])
-        coef = self.amp * self.driver.send / self.load_norm
-        return np.concatenate([[float(coef @ self.ref)], coef * self.scale])
+            #  the (B) control puts the whole disturbance in the INTERCEPT and
+            #  nothing in the peer channels -- over the LIVE columns, so this
+            #  matches psi width for width whatever P-3.4 pruned
+            return np.concatenate([[self.amp], np.zeros(self.dim - 1)])
+        #  over the LIVE classes only, to match psi column for column: a pruned
+        #  class has x == 0 everywhere, so it contributes nothing to mag either.
+        live = self.coupling.live
+        coef = (self.amp * self.driver.send / self.load_norm)[live]
+        return np.concatenate([[float(coef @ self.ref[live])], coef * self.scale[live]])
 
     def _update_cond(self):
         m = min(self._ring_n, self._ring.shape[0])
