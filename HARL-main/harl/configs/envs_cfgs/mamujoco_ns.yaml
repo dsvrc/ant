@@ -59,19 +59,64 @@
 #  HCM heavy-rain figure only so the instances share a severity scale.  Every
 #  sigma > 1 is a BEYOND-PHYSICAL stress test and is labelled so everywhere.
 #
-#  COMMITTED OPERATING POINT.  ns_severity below is a PLACEHOLDER until
-#  calibrate.py has run against a trained B0 checkpoint.  Commit the chosen row
-#  and the ladder it came from here:
+#  COMMITTED OPERATING POINT: sigma = 4, from calibrate.py --phase peak against
+#  a frozen B0 checkpoint.  Return of the FROZEN B0 policy, B0 = 6036.3:
 #
-#    sigma   blind   pact   oracle   intercept   corr_clipped   (return, 3 seeds)
-#    0       ....    ....   ....     ....        ....           <- from calibrate.py
-#    1       ....    ....   ....     ....        ....
-#    2       ....    ....   ....     ....        ....
-#    3       ....    ....   ....     ....        ....
+#    sigma   blind   pactoff    pact   oracle  intercept  corr_clip   eps
+#    0      6036.3    6036.3  6036.3   6036.3    6036.3       0        20
+#    0.5    5546.1    5546.1  5554.3   6036.3    6015.9       0        20
+#    1      6139.4    6139.4  5945.8   6036.3    6162.5       0        20
+#    2      6034.8    6034.8  5889.8   6036.3    5460.1       0        20
+#    3      5748.9    5748.9  5759.6   6036.3    5675.2       0        30
+#    3.25   5388.7    5388.7  5572.5   6036.3    5689.7       0        30
+#    3.5    5363.2    5363.2  5628.8   6036.3    5461.3       0        30
+#    4      4641.6    4641.6  5878.8   6036.3    5817.7       0        30   <- COMMITTED
 #
-#  Choose the smallest sigma at which the blind arm has lost a clear margin and
-#  the oracle still recovers B0 -- the row then measures the METHOD rather than
-#  the environment.
+#  SE ~ 238 at 30 episodes.  At sigma = 4 the blind arm holds 76.9% of B0 and
+#  pact 97.4%: a 1237-point gap, ~3.7 SE.  The oracle returns EXACTLY 6036.3 at
+#  every row -- the channel inverse is exact, and pactoff == blind bit for bit.
+#
+#  WHY 4 AND NOT 2.  The medium feeds back on itself: Q_t = rho*Q_{t-1} +
+#  (1-rho)*G*tau_{t-1} with tau_{t-1} = u_exec = a + d_{t-1}, so the disturbance
+#  is an input to its own next value.  Below a critical severity the loop gain is
+#  under 1 and |d| is LINEAR in sigma; above it the uncompensated commons
+#  self-excites until the actuator limit bounds it.  Measured offline (rms |d|,
+#  synthetic gait): blind tracks the oracle's exact 0.039*sigma line to sigma =
+#  3 (0.118 vs 0.117) and then departs -- 0.321 at 3.25, 0.473 at 3.5, 0.713 at
+#  4, clipping 24% of steps.  With the actuator limit removed it diverges to
+#  7.6e5, so it is a true instability and not a clipping artifact.  sigma* ~ 3.1
+#  is therefore a MEASURED PROPERTY OF THE MEDIUM, not a tuned number, and the
+#  ladder above is reported across it rather than at a chosen point.
+#
+#  THE COMPENSATOR IS STABILISING, WHICH IS THE MECHANISM.  The oracle cancels d
+#  BEFORE execution, so u_exec = a, so tau_prev carries no disturbance and the
+#  loop never closes: its |d| column is linear at every sigma and it never clips
+#  (0% at sigma = 5, against blind's 39%).
+#
+#  HONEST LIMIT 1 -- THE MECHANISM CHANGES ACROSS THE KNEE.  Below sigma* the
+#  story is "a disturbance you must estimate"; above it, "an uncompensated
+#  commons self-excites".  The sigma = 4 gap is NOT the same phenomenon as the
+#  sigma = 1 anchor and must not be presented as it.  sigma = 4 is 4x the stated
+#  calibration anchor and is BEYOND-PHYSICAL; label it so in every table.
+#
+#  HONEST LIMIT 2 -- pact AND intercept TIE IN RETURN, AT EVERY ROW.  The
+#  differences are +84.4 / -117.2 / +167.5 / +61.1 (sigma 3 / 3.25 / 3.5 / 4),
+#  never above 0.5 SE and the sign flips once; separating 61 points at SE 238
+#  would need ~4000 episodes.  Once the feed-forward breaks the runaway, the
+#  leftover residual (0.043 intercept vs 0.010 pact, against 0.8 of commanded
+#  torque) is too small to move the gait, so RETURN SATURATES and cannot
+#  attribute the gain to the peer channels.  Do NOT claim pact > intercept in
+#  return.  The (C) evidence is the RESIDUAL -- |executed - commanded| at the
+#  peak, blind 0.3964 / intercept 0.0428 / pact 0.0105 / oracle 0.0002 at sigma
+#  = 4, a 4.1x intercept-over-pact separation measured directly on the quantity
+#  the channel acts on -- together with the ns_direct 0-vs-1 pair below, the
+#  gate-3 lone-agent assertion, and the 2x4 -> 4x2 N-scaling curve.
+#
+#  HONEST LIMIT 3 -- THIS LADDER IS A FROZEN POLICY.  It measures the robustness
+#  of a fixed B0 policy and fixes the operating point.  It is NOT the claim that
+#  MAPPO/HAPPO cannot LEARN under the dial: a policy trained at sigma = 4 from
+#  scratch may partly adapt by lowering its own torque, which lowers the loop
+#  gain.  That is the training experiment, and it has not been run yet.
 
 # -- the host (stock MAMuJoCo Ant; identical to mamujoco.yaml's own keys) ------
 scenario: Ant-v2
@@ -86,15 +131,18 @@ episode_limit: 1000
 #  the dial -- TASK PHYSICS (NS-3.1), so every algorithm runs inside it
 # =============================================================================
 ns_on: 1                 # 1 = the layer is in; 0 = stock Ant (B0)
-ns_severity: 2.0         # sigma.  EXACTLY inert at 0.0.
-                         #   PROVISIONAL, pending calibrate.py against a trained B0.
-                         #   sigma = 2 is a BEYOND-PHYSICAL stress test and must be
-                         #   labelled so in every table and figure.  Chosen because
-                         #   ceiling.py puts the median |d| at 0.129 of the torque
-                         #   range there (q75 0.220, max 0.695) with only 1.1% of
-                         #   draws above the relief valve -- enough to bite, not
-                         #   enough to saturate the compensator.  Replace with the
-                         #   calibrated row and commit the ladder beside it.
+ns_severity: 4.0         # sigma.  EXACTLY inert at 0.0.
+                         #   CALIBRATED: the committed row of the ladder above.
+                         #   sigma = 4 is 4x the stated anchor and is a
+                         #   BEYOND-PHYSICAL stress test -- label it so in every
+                         #   table and figure.  It is the first row at which the
+                         #   blind arm loses a multi-SE margin (76.9% of B0,
+                         #   3.7 SE) while the oracle still recovers B0 EXACTLY.
+                         #   It sits above the medium's own stability threshold
+                         #   sigma* ~ 3.1; see the knee argument above.  The
+                         #   relief valve never fires here (corr_clipped = 0 at
+                         #   every row), so no arm scores through a saturating
+                         #   kick (trap 11).
 
 # -- the driver: A(t), a sin^2 bump that is EXACTLY zero for the cold half -----
 ns_period: 20000         # ~17 min at dt = 0.05 s, the time scale a drivetrain
